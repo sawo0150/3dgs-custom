@@ -8,11 +8,32 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
+# train.py
+# -----------------------------------------------------------------------------
+# REVIEW (이 파일 한눈에 보기)
+# -----------------------------------------------------------------------------
+# 이 스크립트는 3D Gaussian Splatting의 "학습 루프"를 담당합니다.
+#
+# 큰 흐름:
+#   1) Scene / GaussianModel 생성 및 optimizer 세팅
+#   2) 매 iteration마다 랜덤 카메라(viewpoint) 하나 뽑아서 render
+#   3) render 결과 vs GT 이미지로 loss 계산 (L1 + DSSIM, + optional depth reg)
+#   4) backward
+#   5) (densification 구간이면) gaussians를 늘리거나(prune/densify) opacity reset
+#   6) optimizer step + 주기적 저장/테스트
+#
+# 핵심 키워드:
+#   - render() 가 미분 가능(differentiable)하게 2D rasterization을 수행
+#   - densify_and_prune() 가 포인트 수를 "학습 중"에 조절(성능의 핵심)
+# -----------------------------------------------------------------------------
 
 import os
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
+# REVIEW: loss_utils의 ssim은 보통 "SSIM" 반환(높을수록 유사).
+# 여기선 (1-SSIM)을 loss로 씁니다. 즉 SSIM을 최대화하는 것과 동일.
+
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -22,25 +43,44 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+
 try:
+    # REVIEW: TensorBoard는 "있으면 쓰고 없으면 안 씀" (optional dependency)
+    # 따라서 서버 환경/conda 환경에 따라 로깅이 조용히 꺼질 수 있음.
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
 
 try:
+    # REVIEW: fused_ssim이 있으면 ssim 계산을 더 빠르게(커스텀 CUDA/확장) 수행.
+    # 없으면 파이썬 구현/일반 구현 ssim() 사용.
     from fused_ssim import fused_ssim
     FUSED_SSIM_AVAILABLE = True
 except:
     FUSED_SSIM_AVAILABLE = False
 
 try:
+    # REVIEW: SparseGaussianAdam은 "보이는 가우시안만" 업데이트해서 속도/메모리 최적화.
+    # diff_gaussian_rasterization(가속 rasterizer) 설치가 되어 있어야 함.
+    # opt.optimizer_type == "sparse_adam" 일 때만 사용.
     from diff_gaussian_rasterization import SparseGaussianAdam
     SPARSE_ADAM_AVAILABLE = True
 except:
     SPARSE_ADAM_AVAILABLE = False
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+    # -------------------------------------------------------------------------
+    # REVIEW: training() 인자 의미
+    #   dataset : 데이터/카메라/이미지/옵션(white_background 등) 포함
+    #   opt     : OptimizationParams (iterations, lr schedule, densify 설정 등)
+    #   pipe    : PipelineParams (SH 계산 방식, covariance 계산 방식, debug 등)
+    #   testing_iterations : 테스트/리포트 수행 iteration 리스트
+    #   saving_iterations  : 결과 저장 iteration 리스트
+    #   checkpoint_iterations : 체크포인트 저장 iteration 리스트
+    #   checkpoint : 재개(restore)할 체크포인트 경로
+    #   debug_from : 특정 iteration부터 pipe.debug 켜서 디버깅
+    # -------------------------------------------------------------------------
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
