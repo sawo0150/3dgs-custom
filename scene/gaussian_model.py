@@ -28,19 +28,25 @@ except:
     pass
 
 class GaussianModel:
-
+    # -------------------------------------------------------------------------
+    # REVIEW: 1. 활성화 함수(Activation Functions) 설정
+    # 학습 가능한 파라미터들이 물리적으로 올바른 범위를 가지도록 변환해주는 함수들입니다.
+    # -------------------------------------------------------------------------
     def setup_functions(self):
         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
+            # 스케일(크기)과 회전(쿼터니언) 값을 이용해 3D 공분산(Covariance) 행렬을 만듭니다.
             L = build_scaling_rotation(scaling_modifier * scaling, rotation)
             actual_covariance = L @ L.transpose(1, 2)
             symm = strip_symmetric(actual_covariance)
             return symm
         
+        # 스케일(크기)은 무조건 양수여야 하므로 지수 함수(exp)를 통과시킵니다.
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
 
         self.covariance_activation = build_covariance_from_scaling_rotation
 
+        # 투명도(Opacity)는 0~1 사이의 값이어야 하므로 시그모이드(Sigmoid)를 사용합니다.
         self.opacity_activation = torch.sigmoid
         self.inverse_opacity_activation = inverse_sigmoid
 
@@ -51,20 +57,24 @@ class GaussianModel:
         self.active_sh_degree = 0
         self.optimizer_type = optimizer_type
         self.max_sh_degree = sh_degree  
-        self._xyz = torch.empty(0)
-        self._features_dc = torch.empty(0)
-        self._features_rest = torch.empty(0)
-        self._scaling = torch.empty(0)
-        self._rotation = torch.empty(0)
-        self._opacity = torch.empty(0)
-        self.max_radii2D = torch.empty(0)
-        self.xyz_gradient_accum = torch.empty(0)
-        self.denom = torch.empty(0)
+
+        # 가우시안 포인트들을 구성하는 핵심 파라미터 텐서들 (초기엔 비어있음)
+        self._xyz = torch.empty(0)                  # 위치 (X, Y, Z)
+        self._features_dc = torch.empty(0)          # 기본 색상 (Spherical Harmonics의 0차항)
+        self._features_rest = torch.empty(0)        # 보는 각도에 따른 색상 변화 (SH의 나머지 고차항)
+        self._scaling = torch.empty(0)              # 크기 (Scale)
+        self._rotation = torch.empty(0)             # 회전 (Rotation, 쿼터니언)
+        self._opacity = torch.empty(0)              # 불투명도 (Opacity)
+
+        self.max_radii2D = torch.empty(0)           # 화면에 투영되었을 때의 최대 반지름 (Pruning에 사용)
+        self.xyz_gradient_accum = torch.empty(0)    # 위치가 얼마나 빗나갔는지 그래디언트 누적 (Densify에 사용)
+        self.denom = torch.empty(0)                 # 뷰에서 관측된 횟수 누적
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
 
+    #  모델 상태를 저장하고 불러오는 capture, restore 메서드
     def capture(self):
         return (
             self.active_sh_degree,
@@ -99,6 +109,11 @@ class GaussianModel:
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
 
+    # -------------------------------------------------------------------------
+    # REVIEW: 2. 파라미터 Getter 프로퍼티
+    # 실제 렌더링을 할 때 파라미터를 그대로 쓰지 않고, setup_functions에서 정의한
+    # 활성화 함수(exp, sigmoid, normalize 등)를 거친 "진짜 물리적 값"을 반환합니다.
+    # -------------------------------------------------------------------------
     @property
     def get_scaling(self):
         return self.scaling_activation(self._scaling)
@@ -143,26 +158,36 @@ class GaussianModel:
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
     def oneupSHdegree(self):
+        # SH(Spherical Harmonics) 차수를 점진적으로 올려서 디테일한 반사광/색상을 학습합니다.
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
+    # -------------------------------------------------------------------------
+    # REVIEW: 3. 포인트 클라우드 초기화
+    # COLMAP 등으로 얻은 초기 3D 포인트 클라우드(PCD)를 가우시안으로 변환합니다.
+    # -------------------------------------------------------------------------
     def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
-        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())       # RGB를 SH로 변환
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color
-        features[:, 3:, 1:] = 0.0
+        features[:, 3:, 1:] = 0.0           # 나머지 고차항은 0으로 초기화
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
+        # KNN을 통해 가장 가까운 이웃 포인트들과의 거리를 계산하여 가우시안의 "초기 크기(Scale)"를 결정합니다.
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+
+        # 초기 회전은 변환 없음(Identity 쿼터니언 [1,0,0,0])
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
+        # 초기 투명도는 0.1로 옅게 시작합니다. (inverse_sigmoid 적용하여 저장)
         opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
+        # 모든 텐서를 nn.Parameter로 감싸서 PyTorch가 역전파(Backprop)로 값을 업데이트할 수 있게(requires_grad=True) 만듭니다.
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
@@ -175,11 +200,16 @@ class GaussianModel:
         exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
 
+    # -------------------------------------------------------------------------
+    # REVIEW: 4. 학습 준비 및 파라미터별 Optimizer 설정
+    # 각 파라미터(위치, 크기, 색상 등)마다 학습되는 속도(Learning Rate)가 달라야 합니다.
+    # -------------------------------------------------------------------------
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
+        # 파라미터 그룹 분리 (가우시안의 특성에 맞춰 LR를 다르게 부여)
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
@@ -192,6 +222,7 @@ class GaussianModel:
         if self.optimizer_type == "default":
             self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         elif self.optimizer_type == "sparse_adam":
+            # Sparse Adam을 쓰면 보이지 않는 가우시안의 그래디언트를 계산하지 않아 메모리와 속도가 향상됩니다.
             try:
                 self.optimizer = SparseGaussianAdam(l, lr=0.0, eps=1e-15)
             except:
@@ -200,6 +231,7 @@ class GaussianModel:
 
         self.exposure_optimizer = torch.optim.Adam([self._exposure])
 
+        # xyz 위치 값은 학습이 진행될수록 점점 작게 움직이도록 스케줄러를 적용합니다.
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
@@ -313,6 +345,14 @@ class GaussianModel:
 
         self.active_sh_degree = self.max_sh_degree
 
+    # -------------------------------------------------------------------------
+    # REVIEW: 5. 텐서 크기 동적 조작 유틸리티
+    # 이 부분이 기술적으로 매우 중요합니다!
+    # 학습 도중에 가우시안 포인트의 "개수"가 늘어나거나 줄어듭니다.
+    # 하지만 PyTorch Optimizer(Adam)는 각 파라미터의 과거 모멘텀(exp_avg 등)을 기억하고 있으므로,
+    # 파라미터 텐서의 크기(개수)를 바꿀 때 Optimizer 내부의 상태(state) 텐서 크기도 똑같이 맞춰주어야 에러가 나지 않습니다.
+    # _prune_optimizer, cat_tensors_to_optimizer 등이 이 복잡한 작업을 안전하게 처리해 줍니다.
+    # -------------------------------------------------------------------------
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -406,7 +446,16 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
+    # -------------------------------------------------------------------------
+    # REVIEW: 6. 밀도 조절의 핵심 - 분할(Split)과 복제(Clone)
+    # 그래디언트(오차)가 높은 지역은 디테일이 부족하다는 뜻이므로 가우시안을 추가합니다.
+    # -------------------------------------------------------------------------
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+        # [조건] 1. 그래디언트가 높고 (오차가 크고) 
+        #        2. 크기(scale)가 이미 너무 커서(Over-reconstruction) 하나의 가우시안이 너무 넓은 영역을 덮고 있는 경우.
+        # [행동] 해당 가우시안을 N개(보통 2개)로 "분할(Split)"하여 크기를 줄이고 세밀하게 만듭니다.
+
+        # ... 마스크 필터링 로직 ...
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -418,8 +467,12 @@ class GaussianModel:
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
         samples = torch.normal(mean=means, std=stds)
+
+        # 기존 가우시안의 크기와 회전을 바탕으로 새 가우시안들의 위치를 살짝씩 떨어뜨립니다.
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
+
+        # 크기는 기존보다 1.6배(0.8 * N) 작아지도록 세팅합니다.
         new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
@@ -427,17 +480,25 @@ class GaussianModel:
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
 
+        # 새로 만든 포인트들을 옵티마이저에 추가하고, 기존 큰 포인트는 지웁니다(Prune).
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
+        # [조건] 1. 그래디언트가 높고 (오차가 크고)
+        #        2. 크기(scale)가 작은 경우 (Under-reconstruction).
+        # [행동] 작은 디테일이 필요한데 포인트가 부족한 상황이므로, 옆에 똑같은 가우시안을 "복제(Clone)"하여 위치만 살짝 옮겨서 학습되게 둡니다.
         # Extract points that satisfy the gradient condition
+
+
+        # ... 마스크 필터링 로직 ...
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
         
+        # 크기를 줄이지 않고 파라미터를 그대로 복사합니다.
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
@@ -449,18 +510,26 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
 
+    # -------------------------------------------------------------------------
+    # REVIEW: 7. 최상위 Densify & Prune 관리자 함수
+    # 학습 루프(train.py)에서 매 N번째 이터레이션마다 이 함수를 호출합니다.
+    # -------------------------------------------------------------------------
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
+        # 1. 픽셀 위치를 움직이려는 힘(Gradient)의 평균을 구합니다.
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
         self.tmp_radii = radii
+
+        # 2. 그래디언트가 높은 곳에 가우시안을 복제(Clone)하거나 분할(Split)합니다.
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
 
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        # 3. 필요 없어진 가우시안들을 걸러내어 삭제(Prune)합니다.
+        prune_mask = (self.get_opacity < min_opacity).squeeze()      # 너무 투명해져서 안 보이는 것
         if max_screen_size:
-            big_points_vs = self.max_radii2D > max_screen_size
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            big_points_vs = self.max_radii2D > max_screen_size          # 화면을 너무 많이 덮어버리는 렌즈 플레어 같은 녀석들
+            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent       # 3D 공간상에서 비정상적으로 커진 녀석들
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
         tmp_radii = self.tmp_radii
@@ -469,5 +538,7 @@ class GaussianModel:
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
+        # 매 렌더링마다, 화면상(2D Viewspace)에서 각 포인트들이 "어느 방향으로 움직여야 정답(GT)과 비슷해지는지"에 대한 그래디언트(수정 요구치)를 누적합니다.
+        # 이 누적값이 크면 클수록 "이 영역은 하나의 포인트로 표현하기 부족하다"는 의미이므로 Split이나 Clone의 타겟이 됩니다.
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
