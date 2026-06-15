@@ -1,0 +1,5 @@
+mode: colmap
+pose_path: null
+format: auto
+timestamp_align: false
+use_pose_override: false

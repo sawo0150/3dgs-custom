@@ -1,0 +1,11 @@
+name: aria_offline
+source_path: ./data/aria_scene
+images: images
+model_path: null
+depths: ""
+resolution: -1
+white_background: false
+eval: false
+train_test_exp: false
+data_device: cuda
+manifest_path: ./outputs/manifest.jsonl

@@ -1,0 +1,6 @@
+name: parallax
+keyframe_list_path: null
+selection_keep_test: true
+parallax_thresh_px: 8.0
+max_gap: 20
+min_gap: 0

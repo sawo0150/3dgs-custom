@@ -1,3 +1,5 @@
+# aria_to_3dgs.py
+
 import os
 import numpy as np
 import pandas as pd
@@ -15,8 +17,13 @@ def main():
     parser = argparse.ArgumentParser(description="Convert Aria Data to 3DGS (COLMAP) format")
     parser.add_argument("--aria_dir", type=str, required=True, help="Aria 데이터 폴더 경로 (예: .../301_1253)")
     parser.add_argument("--output_dir", type=str, required=True, help="변환된 3DGS 데이터가 저장될 경로")
+    parser.add_argument("--vrs_file", type=str, default=None, help="직접 지정할 .vrs 파일 경로")
+    parser.add_argument("--trajectory_csv", type=str, default=None, help="직접 지정할 closed_loop_trajectory.csv 경로")
+    parser.add_argument("--points_csv", type=str, default=None, help="직접 지정할 semidense_points.csv.gz 경로")
     parser.add_argument("--width", type=int, default=1024, help="출력 이미지 가로 해상도")
     parser.add_argument("--height", type=int, default=1024, help="출력 이미지 세로 해상도")
+    parser.add_argument("--frame_stride", type=int, default=1, help="RGB frame sampling stride")
+    parser.add_argument("--max_images", type=int, default=0, help="Maximum number of RGB frames to export. 0 means no cap.")
     parser.add_argument("--alpha_mask", action="store_true", help="Fisheye 밖의 빈 공간을 투명 마스킹 처리 (PNG 저장)")
     parser.add_argument("--rotate", action="store_true", help="이미지를 시계 방향으로 90도 회전 및 좌표계 동기화")
     args = parser.parse_args()
@@ -28,9 +35,18 @@ def main():
     # 폴더 이름을 기반으로 .vrs 파일과 mps 폴더 이름 자동 추론
     base_name = os.path.basename(os.path.normpath(aria_dir))
     
-    vrs_file = os.path.join(aria_dir, f"{base_name}.vrs")
-    traj_csv = os.path.join(aria_dir, f"mps_{base_name}_vrs", "slam", "closed_loop_trajectory.csv")
-    points_csv = os.path.join(aria_dir, f"mps_{base_name}_vrs", "slam", "semidense_points.csv.gz")
+    vrs_file = os.path.abspath(args.vrs_file) if args.vrs_file else os.path.join(aria_dir, f"{base_name}.vrs")
+    traj_csv = os.path.abspath(args.trajectory_csv) if args.trajectory_csv else os.path.join(aria_dir, f"mps_{base_name}_vrs", "slam", "closed_loop_trajectory.csv")
+    points_csv = os.path.abspath(args.points_csv) if args.points_csv else os.path.join(aria_dir, f"mps_{base_name}_vrs", "slam", "semidense_points.csv.gz")
+
+    required_files = {
+        "VRS": vrs_file,
+        "closed-loop trajectory": traj_csv,
+        "semidense points": points_csv,
+    }
+    missing = [f"{label}: {path}" for label, path in required_files.items() if not os.path.isfile(path)]
+    if missing:
+        raise FileNotFoundError("필수 입력 파일을 찾을 수 없습니다.\n" + "\n".join(missing))
 
     # 3DGS가 요구하는 COLMAP 형태의 출력 폴더 구조 세팅
     img_out_dir = os.path.join(out_dir, "images")
@@ -80,10 +96,14 @@ def main():
     # ----------------------------------------------------------------
     images_txt_lines = []
     num_images = provider.get_num_data(rgb_stream_id)
+    frame_indices = list(range(0, num_images, max(1, args.frame_stride)))
+    if args.max_images and args.max_images > 0 and len(frame_indices) > args.max_images:
+        sampled = np.linspace(0, len(frame_indices) - 1, args.max_images, dtype=np.int64)
+        frame_indices = [frame_indices[int(idx)] for idx in sampled]
     
     print("이미지 Undistortion 및 Pose 계산 중...")
     valid_img_id = 1
-    for i in tqdm(range(num_images)):
+    for i in tqdm(frame_indices):
         image_data, record = provider.get_image_data_by_index(rgb_stream_id, i)
         image_time_ns = record.capture_timestamp_ns
         

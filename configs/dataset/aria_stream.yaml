@@ -1,0 +1,15 @@
+name: aria_stream
+source_path: ./data/aria_stream
+images: images
+model_path: null
+depths: ""
+resolution: -1
+white_background: false
+eval: false
+train_test_exp: false
+data_device: cuda
+manifest_path: null
+stream:
+  enabled: true
+  mode: replay
+  fps: 5.0

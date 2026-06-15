@@ -1,0 +1,5 @@
+mode: est
+pose_path: ./poses/est.jsonl
+format: jsonl
+timestamp_align: true
+use_pose_override: true

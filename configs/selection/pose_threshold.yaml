@@ -1,0 +1,7 @@
+name: pose_threshold
+keyframe_list_path: null
+selection_keep_test: true
+trans_thresh_m: 0.15
+rot_thresh_deg: 10.0
+max_gap: 20
+min_gap: 0

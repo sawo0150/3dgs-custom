@@ -1,0 +1,6 @@
+name: uniform
+keyframe_list_path: null
+selection_keep_test: true
+stride: 10
+offset: 0
+max_gap: 1000000

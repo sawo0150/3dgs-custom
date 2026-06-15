@@ -1,0 +1,9 @@
+enabled: true
+project: 3dgs-keyframe
+entity: null
+name: null
+tags: [keyframe, 3dgs]
+mode: online
+log_images_every: 1000
+log_selection_table: true
+upload_artifacts: true

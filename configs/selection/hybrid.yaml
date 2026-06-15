@@ -1,0 +1,11 @@
+name: hybrid
+keyframe_list_path: null
+selection_keep_test: true
+trans_thresh_m: 0.15
+rot_thresh_deg: 10.0
+parallax_thresh_px: 8.0
+max_gap: 20
+min_gap: 0
+blur_max: 1.0e9
+brightness_min: 0.0
+brightness_max: 255.0

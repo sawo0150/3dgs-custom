@@ -1,0 +1,3 @@
+mode: replay
+replay_fps: 5.0
+update_interval: null

@@ -1,0 +1,5 @@
+mode: gt
+pose_path: ./poses/gt.jsonl
+format: jsonl
+timestamp_align: true
+use_pose_override: true

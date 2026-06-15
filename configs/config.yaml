@@ -1,0 +1,15 @@
+defaults:
+  - dataset: colmap
+  - pose: colmap
+  - selection: pose_threshold
+  - train: fast
+  - logging: off
+  - runtime: offline
+  - viewer: off
+  - _self_
+
+project:
+  name: 3dgs-keyframe
+  seed: 42
+  output_root: ./outputs
+  run_name: ${project.name}_${selection.name}_${now:%Y%m%d_%H%M%S}
