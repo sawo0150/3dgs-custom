@@ -69,6 +69,15 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)           # 화면에 투영되었을 때의 최대 반지름 (Pruning에 사용)
         self.xyz_gradient_accum = torch.empty(0)    # 위치가 얼마나 빗나갔는지 그래디언트 누적 (Densify에 사용)
         self.denom = torch.empty(0)                 # 뷰에서 관측된 횟수 누적
+        self.ancestor_idx = torch.empty(0, dtype=torch.long, device="cuda")
+        self.birth_step = torch.empty(0, dtype=torch.int, device="cuda")
+        self.generation = torch.empty(0, dtype=torch.int, device="cuda")
+        self.num_splits = torch.empty(0, dtype=torch.int, device="cuda")
+        self.num_clones = torch.empty(0, dtype=torch.int, device="cuda")
+        self.accum_visibility = torch.empty(0, dtype=torch.int, device="cuda")
+        self.accum_rgb_grad = torch.empty(0, dtype=torch.float, device="cuda")
+        self.accum_rgb_grad_vec = torch.empty(0, 3, dtype=torch.float, device="cuda")
+        self.accum_plateau_grad = torch.empty(0, dtype=torch.float, device="cuda")
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
@@ -195,6 +204,16 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        num_pts = fused_point_cloud.shape[0]
+        self.ancestor_idx = torch.arange(num_pts, dtype=torch.long, device="cuda")
+        self.birth_step = torch.zeros(num_pts, dtype=torch.int, device="cuda")
+        self.generation = torch.zeros(num_pts, dtype=torch.int, device="cuda")
+        self.num_splits = torch.zeros(num_pts, dtype=torch.int, device="cuda")
+        self.num_clones = torch.zeros(num_pts, dtype=torch.int, device="cuda")
+        self.accum_visibility = torch.zeros(num_pts, dtype=torch.int, device="cuda")
+        self.accum_rgb_grad = torch.zeros(num_pts, dtype=torch.float, device="cuda")
+        self.accum_rgb_grad_vec = torch.zeros(num_pts, 3, dtype=torch.float, device="cuda")
+        self.accum_plateau_grad = torch.zeros(num_pts, dtype=torch.float, device="cuda")
         self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}
         self.pretrained_exposures = None
         exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
@@ -219,15 +238,20 @@ class GaussianModel:
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
 
+        adam_betas = (
+            float(getattr(training_args, "optimizer_beta1", 0.9)),
+            float(getattr(training_args, "optimizer_beta2", 0.999)),
+        )
+
         if self.optimizer_type == "default":
-            self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+            self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15, betas=adam_betas)
         elif self.optimizer_type == "sparse_adam":
             # Sparse Adam을 쓰면 보이지 않는 가우시안의 그래디언트를 계산하지 않아 메모리와 속도가 향상됩니다.
             try:
                 self.optimizer = SparseGaussianAdam(l, lr=0.0, eps=1e-15)
             except:
                 # A special version of the rasterizer is required to enable sparse adam
-                self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+                self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15, betas=adam_betas)
 
         self.exposure_optimizer = torch.optim.Adam([self._exposure])
 
@@ -266,6 +290,7 @@ class GaussianModel:
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
+        l.extend(['ancestor_idx', 'birth_step', 'generation', 'num_splits', 'num_clones', 'accum_visibility', 'accum_rgb_grad', 'accum_plateau_grad', 'accum_rgb_gvec_x', 'accum_rgb_gvec_y', 'accum_rgb_gvec_z'])
         return l
 
     def save_ply(self, path):
@@ -278,11 +303,22 @@ class GaussianModel:
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
+        ancestor_idx = self.ancestor_idx.detach().cpu().numpy()[:, None].astype(np.float32)
+        birth_step = self.birth_step.detach().cpu().numpy()[:, None].astype(np.float32)
+        generation = self.generation.detach().cpu().numpy()[:, None].astype(np.float32)
+        num_splits = self.num_splits.detach().cpu().numpy()[:, None].astype(np.float32)
+        num_clones = self.num_clones.detach().cpu().numpy()[:, None].astype(np.float32)
+        accum_visibility = self.accum_visibility.detach().cpu().numpy()[:, None].astype(np.float32)
+        accum_rgb_grad = self.accum_rgb_grad.detach().cpu().numpy()[:, None].astype(np.float32)
+        accum_rgb_grad_vec = self.accum_rgb_grad_vec.detach().cpu().numpy().astype(np.float32)
+        accum_plateau_grad = self.accum_plateau_grad.detach().cpu().numpy()[:, None].astype(np.float32)
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation,
+                                     ancestor_idx, birth_step, generation, num_splits, num_clones,
+                                     accum_visibility, accum_rgb_grad, accum_plateau_grad, accum_rgb_grad_vec), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -343,6 +379,32 @@ class GaussianModel:
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
+        prop_names = [p.name for p in plydata.elements[0].properties]
+        if 'ancestor_idx' in prop_names:
+            self.ancestor_idx = torch.tensor(np.asarray(plydata.elements[0]["ancestor_idx"]), dtype=torch.long, device="cuda")
+            self.birth_step = torch.tensor(np.asarray(plydata.elements[0]["birth_step"]), dtype=torch.int, device="cuda")
+            self.generation = torch.tensor(np.asarray(plydata.elements[0]["generation"]), dtype=torch.int, device="cuda")
+            self.num_splits = torch.tensor(np.asarray(plydata.elements[0]["num_splits"]), dtype=torch.int, device="cuda")
+            self.num_clones = torch.tensor(np.asarray(plydata.elements[0]["num_clones"]), dtype=torch.int, device="cuda")
+            self.accum_visibility = torch.tensor(np.asarray(plydata.elements[0]["accum_visibility"]), dtype=torch.int, device="cuda")
+            self.accum_rgb_grad = torch.tensor(np.asarray(plydata.elements[0]["accum_rgb_grad"]), dtype=torch.float, device="cuda")
+            try:
+                self.accum_rgb_grad_vec = torch.tensor(np.stack([np.asarray(plydata.elements[0][f"accum_rgb_gvec_{c}"]) for c in "xyz"], 1), dtype=torch.float, device="cuda")
+            except Exception:
+                self.accum_rgb_grad_vec = torch.zeros(len(xyz), 3, dtype=torch.float, device="cuda")
+            self.accum_plateau_grad = torch.tensor(np.asarray(plydata.elements[0]["accum_plateau_grad"]), dtype=torch.float, device="cuda")
+        else:
+            num_pts = xyz.shape[0]
+            self.ancestor_idx = torch.arange(num_pts, dtype=torch.long, device="cuda")
+            self.birth_step = torch.zeros(num_pts, dtype=torch.int, device="cuda")
+            self.generation = torch.zeros(num_pts, dtype=torch.int, device="cuda")
+            self.num_splits = torch.zeros(num_pts, dtype=torch.int, device="cuda")
+            self.num_clones = torch.zeros(num_pts, dtype=torch.int, device="cuda")
+            self.accum_visibility = torch.zeros(num_pts, dtype=torch.int, device="cuda")
+            self.accum_rgb_grad = torch.zeros(num_pts, dtype=torch.float, device="cuda")
+            self.accum_rgb_grad_vec = torch.zeros(num_pts, 3, dtype=torch.float, device="cuda")
+            self.accum_plateau_grad = torch.zeros(num_pts, dtype=torch.float, device="cuda")
+
         self.active_sh_degree = self.max_sh_degree
 
     # -------------------------------------------------------------------------
@@ -401,7 +463,17 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
-        self.tmp_radii = self.tmp_radii[valid_points_mask]
+        self.ancestor_idx = self.ancestor_idx[valid_points_mask]
+        self.birth_step = self.birth_step[valid_points_mask]
+        self.generation = self.generation[valid_points_mask]
+        self.num_splits = self.num_splits[valid_points_mask]
+        self.num_clones = self.num_clones[valid_points_mask]
+        self.accum_visibility = self.accum_visibility[valid_points_mask]
+        self.accum_rgb_grad = self.accum_rgb_grad[valid_points_mask]
+        self.accum_rgb_grad_vec = self.accum_rgb_grad_vec[valid_points_mask]
+        self.accum_plateau_grad = self.accum_plateau_grad[valid_points_mask]
+        if self.tmp_radii is not None:
+            self.tmp_radii = self.tmp_radii[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -450,7 +522,7 @@ class GaussianModel:
     # REVIEW: 6. 밀도 조절의 핵심 - 분할(Split)과 복제(Clone)
     # 그래디언트(오차)가 높은 지역은 디테일이 부족하다는 뜻이므로 가우시안을 추가합니다.
     # -------------------------------------------------------------------------
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, iteration=0):
         # [조건] 1. 그래디언트가 높고 (오차가 크고) 
         #        2. 크기(scale)가 이미 너무 커서(Over-reconstruction) 하나의 가우시안이 너무 넓은 영역을 덮고 있는 경우.
         # [행동] 해당 가우시안을 N개(보통 2개)로 "분할(Split)"하여 크기를 줄이고 세밀하게 만듭니다.
@@ -463,6 +535,18 @@ class GaussianModel:
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+
+        # 출생 이벤트 로그: split 방아쇠 시점의 부모 상태 (허공-걸친-큰-부모 가설 검증용)
+        if not hasattr(self, "split_log"):
+            self.split_log = []
+        if selected_pts_mask.any():
+            self.split_log.append({
+                "iteration": int(iteration),
+                "parent_xyz": self.get_xyz[selected_pts_mask].detach().cpu().numpy().astype(np.float16),
+                "parent_max_scale": self.get_scaling[selected_pts_mask].max(dim=1).values.detach().cpu().numpy().astype(np.float16),
+                "parent_opacity": self.get_opacity[selected_pts_mask, 0].detach().cpu().numpy().astype(np.float16),
+                "parent_grad": padded_grad[selected_pts_mask].detach().cpu().numpy().astype(np.float16),
+            })
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
@@ -480,13 +564,33 @@ class GaussianModel:
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
 
+        new_ancestor_idx = self.ancestor_idx[selected_pts_mask].repeat(N)
+        new_birth_step = torch.full_like(self.birth_step[selected_pts_mask].repeat(N), iteration)
+        new_generation = self.generation[selected_pts_mask].repeat(N) + 1
+        new_num_splits = self.num_splits[selected_pts_mask].repeat(N) + 1
+        new_num_clones = self.num_clones[selected_pts_mask].repeat(N)
+        new_accum_visibility = torch.zeros_like(self.accum_visibility[selected_pts_mask].repeat(N))
+        new_accum_rgb_grad = torch.zeros_like(self.accum_rgb_grad[selected_pts_mask].repeat(N))
+        new_accum_rgb_grad_vec = torch.zeros_like(self.accum_rgb_grad_vec[selected_pts_mask].repeat(N, 1))
+        new_accum_plateau_grad = torch.zeros_like(self.accum_plateau_grad[selected_pts_mask].repeat(N))
+
         # 새로 만든 포인트들을 옵티마이저에 추가하고, 기존 큰 포인트는 지웁니다(Prune).
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
+
+        self.ancestor_idx = torch.cat((self.ancestor_idx, new_ancestor_idx), dim=0)
+        self.birth_step = torch.cat((self.birth_step, new_birth_step), dim=0)
+        self.generation = torch.cat((self.generation, new_generation), dim=0)
+        self.num_splits = torch.cat((self.num_splits, new_num_splits), dim=0)
+        self.num_clones = torch.cat((self.num_clones, new_num_clones), dim=0)
+        self.accum_visibility = torch.cat((self.accum_visibility, new_accum_visibility), dim=0)
+        self.accum_rgb_grad = torch.cat((self.accum_rgb_grad, new_accum_rgb_grad), dim=0)
+        self.accum_rgb_grad_vec = torch.cat((self.accum_rgb_grad_vec, new_accum_rgb_grad_vec), dim=0)
+        self.accum_plateau_grad = torch.cat((self.accum_plateau_grad, new_accum_plateau_grad), dim=0)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent):
+    def densify_and_clone(self, grads, grad_threshold, scene_extent, iteration=0):
         # [조건] 1. 그래디언트가 높고 (오차가 크고)
         #        2. 크기(scale)가 작은 경우 (Under-reconstruction).
         # [행동] 작은 디테일이 필요한데 포인트가 부족한 상황이므로, 옆에 똑같은 가우시안을 "복제(Clone)"하여 위치만 살짝 옮겨서 학습되게 둡니다.
@@ -508,13 +612,33 @@ class GaussianModel:
 
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
 
+        new_ancestor_idx = self.ancestor_idx[selected_pts_mask]
+        new_birth_step = torch.full_like(self.birth_step[selected_pts_mask], iteration)
+        new_generation = self.generation[selected_pts_mask] + 1
+        new_num_splits = self.num_splits[selected_pts_mask]
+        new_num_clones = self.num_clones[selected_pts_mask] + 1
+        new_accum_visibility = torch.zeros_like(self.accum_visibility[selected_pts_mask])
+        new_accum_rgb_grad = torch.zeros_like(self.accum_rgb_grad[selected_pts_mask])
+        new_accum_rgb_grad_vec = torch.zeros_like(self.accum_rgb_grad_vec[selected_pts_mask])
+        new_accum_plateau_grad = torch.zeros_like(self.accum_plateau_grad[selected_pts_mask])
+
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
+
+        self.ancestor_idx = torch.cat((self.ancestor_idx, new_ancestor_idx), dim=0)
+        self.birth_step = torch.cat((self.birth_step, new_birth_step), dim=0)
+        self.generation = torch.cat((self.generation, new_generation), dim=0)
+        self.num_splits = torch.cat((self.num_splits, new_num_splits), dim=0)
+        self.num_clones = torch.cat((self.num_clones, new_num_clones), dim=0)
+        self.accum_visibility = torch.cat((self.accum_visibility, new_accum_visibility), dim=0)
+        self.accum_rgb_grad = torch.cat((self.accum_rgb_grad, new_accum_rgb_grad), dim=0)
+        self.accum_rgb_grad_vec = torch.cat((self.accum_rgb_grad_vec, new_accum_rgb_grad_vec), dim=0)
+        self.accum_plateau_grad = torch.cat((self.accum_plateau_grad, new_accum_plateau_grad), dim=0)
 
     # -------------------------------------------------------------------------
     # REVIEW: 7. 최상위 Densify & Prune 관리자 함수
     # 학습 루프(train.py)에서 매 N번째 이터레이션마다 이 함수를 호출합니다.
     # -------------------------------------------------------------------------
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, iteration=0):
         # 1. 픽셀 위치를 움직이려는 힘(Gradient)의 평균을 구합니다.
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
@@ -522,8 +646,8 @@ class GaussianModel:
         self.tmp_radii = radii
 
         # 2. 그래디언트가 높은 곳에 가우시안을 복제(Clone)하거나 분할(Split)합니다.
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        self.densify_and_clone(grads, max_grad, extent, iteration=iteration)
+        self.densify_and_split(grads, max_grad, extent, iteration=iteration)
 
         # 3. 필요 없어진 가우시안들을 걸러내어 삭제(Prune)합니다.
         prune_mask = (self.get_opacity < min_opacity).squeeze()      # 너무 투명해져서 안 보이는 것

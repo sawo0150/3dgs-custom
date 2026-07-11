@@ -1,0 +1,36 @@
+# exp38: Carve Loss 첫 학습 검증 (2026-07-11 설계, gs_floaterLab carve_loss_design.md)
+# 라벨 검증된 설계값. 예상: 수동 floater류 ~60% 억제, 표면 기여손실 ≤0.5%
+#
+# 구성요소:
+#   soft  : score-편향 opacity 압력 (자가 교정적 — 진짜 표면은 RGB가 저항)
+#   prune : 예산 상한부 top-K prune (cycle당 기여손실 0.05%, 총 0.5% 상한)
+#   gate  : densify 직후 score>0.95 신생아 삭제 (출생 차단, 분석상 ~91% 차단)
+
+enabled: true
+
+# Field (분석 검증값 그대로)
+voxel: 0.10
+ray_step: 0.06
+surf_margin: 0.20
+term_k: 3.0
+smooth: 3
+d5_tau: 0.25
+maxop_radius: 0.05
+
+# Soft opacity loss — densification 초반(1k)부터 (floater 31%가 1-3k 출생)
+soft_enabled: true
+lambda_carve: 0.05
+soft_start_iter: 1000
+score_min: 0.3
+
+# 예산 prune — densify 종료 직후부터 (7k 시점 조기 검출 AUC 0.957 확인됨)
+prune_enabled: true
+prune_start_iter: 7000
+prune_interval: 1000
+budget_per_cycle: 0.0005
+budget_total: 0.0075   # 런타임 예산의 ~30%는 floater 기여가 소모 → 실제 표면 harm ≈ 0.5% (보정 07-11)
+prune_score_min: 0.3
+
+# 출생 게이트
+gate_enabled: true
+gate_score: 0.95

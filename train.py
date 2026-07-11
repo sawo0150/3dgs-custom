@@ -28,7 +28,9 @@
 # -----------------------------------------------------------------------------
 
 import os
+import numpy as np
 import torch
+from pathlib import Path
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 # REVIEW: loss_utils의 ssim은 보통 "SSIM" 반환(높을수록 유사).
@@ -43,6 +45,11 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from eval.depth_ambiguity import normalized_ambiguity_image, summarize_depth_ambiguity
+from eval.gaussian_stats import load_sparse_points, save_gaussian_summary, summarize_gaussians
+from eval.sparse_depth_prior import SparseDepthPrior
+from eval.plateau_loss import PlateauLoss, PlateauLossConfig
+from eval.carve_loss import CarveLoss, CarveLossConfig
 
 try:
     # REVIEW: TensorBoard는 "있으면 쓰고 없으면 안 씀" (optional dependency)
@@ -69,7 +76,7 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb_logger=None, plateau_loss_config=None, carve_loss_config=None):
     # -------------------------------------------------------------------------
     # REVIEW: training() 인자 의미
     #   dataset : 데이터/카메라/이미지/옵션(white_background 등) 포함
@@ -118,6 +125,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     # Depth 기반의 정규화(Regularization) loss를 사용할 경우, 학습 진행에 따른 가중치 감소 함수를 설정합니다.
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
+    sparse_depth_weight = get_expon_lr_func(
+        getattr(opt, "sparse_depth_weight_init", 0.0),
+        getattr(opt, "sparse_depth_weight_final", 0.0),
+        max_steps=opt.iterations,
+    )
 
     # 학습에 사용할 카메라 뷰포인트들을 리스트(스택)로 복사해옵니다.
     viewpoint_stack = scene.getTrainCameras().copy()
@@ -126,10 +138,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # 로깅을 위한 지수 이동 평균(EMA) 변수
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
+    ema_sparse_depth_for_log = 0.0
 
     # 학습 진행률을 보여주는 tqdm 프로그레스 바
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+    # Plateau loss (optional — controlled by --plateau_loss_config YAML)
+    if plateau_loss_config is not None:
+        _pl_cfg = PlateauLossConfig.from_yaml(plateau_loss_config)
+        plateau_loss = PlateauLoss(_pl_cfg, dataset.source_path)
+    else:
+        plateau_loss = PlateauLoss(PlateauLossConfig(enabled=False), dataset.source_path)
+
+    # Carve loss (optional — controlled by --carve_loss_config YAML)
+    if carve_loss_config is not None:
+        carve_loss = CarveLoss(CarveLossConfig.from_yaml(carve_loss_config), dataset.source_path)
+    else:
+        carve_loss = CarveLoss(CarveLossConfig(enabled=False), dataset.source_path)
+
+    sparse_points = load_sparse_points(dataset.source_path)
+    sparse_depth_prior = SparseDepthPrior(
+        sparse_points,
+        max_points_per_view=int(getattr(opt, "sparse_depth_max_points", 2048)),
+        global_max_points=int(getattr(opt, "sparse_depth_global_max_points", 100000)),
+        min_depth=float(getattr(opt, "sparse_depth_min_depth", 0.2)),
+        require_rendered=bool(getattr(opt, "sparse_depth_require_rendered", True)),
+    )
     
     # -------------------------------------------------------------------------
     # REVIEW: 2. 메인 학습 루프 시작
@@ -265,7 +299,59 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # depth loss를 사용하지 않는 경우(가중치=0 or depth가 unreliable)
             Ll1depth = 0
 
-        loss.backward()
+        sparse_depth_raw = 0.0
+        sparse_depth_points = 0
+        sparse_depth_abs = 0.0
+        sparse_depth_loss_value = 0.0
+        current_sparse_depth_weight = sparse_depth_weight(iteration)
+        if current_sparse_depth_weight > 0 and sparse_depth_prior.available:
+            sparse_depth_raw_tensor, sparse_depth_points, sparse_depth_abs = sparse_depth_prior.loss(
+                render_pkg["depth"],
+                viewpoint_cam,
+            )
+            sparse_depth_loss = current_sparse_depth_weight * sparse_depth_raw_tensor
+            loss += sparse_depth_loss
+            sparse_depth_raw = float(sparse_depth_raw_tensor.detach().item())
+            sparse_depth_loss_value = float(sparse_depth_loss.detach().item())
+
+        # Plateau loss — applies to ALL Gaussians (cyclic subset), not just visible ones
+        loss_rgb = loss
+        
+        # 1단계: RGB & Depth Loss Backward (Photometric Gradient 누적)
+        loss_rgb.backward(retain_graph=True)
+        if gaussians._xyz.grad is not None:
+            gaussians.accum_rgb_grad += gaussians._xyz.grad.norm(dim=-1)
+            gaussians.accum_rgb_grad_vec += gaussians._xyz.grad
+            rgb_xyz_grad = gaussians._xyz.grad.clone()
+            # xyz의 gradient만 0으로 초기화 (다른 파라미터의 grad는 유지)
+            gaussians._xyz.grad.zero_()
+        else:
+            rgb_xyz_grad = None
+
+        # 2단계: Plateau Loss Backward (Plateau Gradient 누적)
+        L_plateau, plateau_metrics = plateau_loss.compute_loss(gaussians, iteration)
+        if L_plateau is not None:
+            loss_plateau_weighted = plateau_loss._lambda_at(iteration) * L_plateau
+            loss_plateau_weighted.backward()
+            if gaussians._xyz.grad is not None:
+                gaussians.accum_plateau_grad += gaussians._xyz.grad.norm(dim=-1)
+            loss = loss_rgb + loss_plateau_weighted
+        else:
+            loss = loss_rgb
+
+        # 2.5단계: Carve loss backward (opacity 전용 gradient — xyz 저글링과 무간섭)
+        L_carve, carve_metrics = carve_loss.compute_loss(gaussians, iteration)
+        if L_carve is not None:
+            L_carve.backward()
+            loss = loss + L_carve.detach()
+
+        # 3단계: RGB xyz gradient를 최종 합산하여 Optimizer Step을 준비
+        if rgb_xyz_grad is not None:
+            if gaussians._xyz.grad is not None:
+                gaussians._xyz.grad += rgb_xyz_grad
+            else:
+                gaussians._xyz.grad = rgb_xyz_grad
+
         iter_end.record()
         # -------------------------------------------------------------------------
         # REVIEW: 5. 최적화 및 구조 변경 (No Grad 블록)
@@ -275,35 +361,145 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # 진행 바 업데이트용 Loss 기록
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
+            ema_sparse_depth_for_log = 0.4 * sparse_depth_loss_value + 0.6 * ema_sparse_depth_for_log
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
+                progress_bar.set_postfix({
+                    "Loss": f"{ema_loss_for_log:.{7}f}",
+                    "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}",
+                    "Sparse Depth": f"{ema_sparse_depth_for_log:.{7}f}",
+                })
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
+
+            ambiguity_log_interval = int(getattr(opt, "ambiguity_log_interval", 2000))
+            if wandb_logger and wandb_logger.enabled and ambiguity_log_interval > 0 and iteration % ambiguity_log_interval == 0:
+                ambiguity_metrics = summarize_depth_ambiguity(render_pkg["alpha_depth"], render_pkg["modes"])
+                train_psnr = psnr(image.unsqueeze(0), gt_image.unsqueeze(0)).mean()
+                ambiguity_metrics.update({
+                    "train/psnr": float(train_psnr.item()),
+                    "train/ssim": float(ssim_value.detach().item()),
+                    "train/l1_loss": float(Ll1.detach().item()),
+                    "train/total_loss": float(loss.detach().item()),
+                    "train/sparse_depth_loss": sparse_depth_loss_value,
+                    "train/sparse_depth_raw": sparse_depth_raw,
+                    "train/sparse_depth_abs": sparse_depth_abs,
+                    "train/sparse_depth_points": sparse_depth_points,
+                    "train/sparse_depth_weight": float(current_sparse_depth_weight),
+                })
+                ambiguity_metrics.update(plateau_metrics)
+                ambiguity_metrics.update(carve_metrics)
+                wandb_logger.log(ambiguity_metrics, step=iteration)
+                ambiguity_image = normalized_ambiguity_image(render_pkg["alpha_depth"], render_pkg["modes"])
+                if ambiguity_image is not None:
+                    wandb_logger.log_tensor_image(
+                        "ambiguity/map",
+                        ambiguity_image.cpu(),
+                        caption=f"{viewpoint_cam.image_name} @ iter {iteration}",
+                        step=iteration,
+                    )
+
+            # Round 2 Diagnostic: Z-axis gradient vs X-axis gradient + Z-drift tracking
+            # 목적: SLAM horizontal trajectory → Z-axis gradient deficiency (P12) 검증
+            diag_grad_interval = int(getattr(opt, "diag_grad_interval", 500))
+            if wandb_logger and wandb_logger.enabled and diag_grad_interval > 0 and iteration % diag_grad_interval == 0:
+                xyz_grad = gaussians._xyz.grad  # [N, 3] or None
+                xyz_world = gaussians.get_xyz.detach()  # [N, 3]
+                # Z-drift tracking: 씬 좌표 기준 Z 분포
+                z_vals = xyz_world[:, 2].cpu().numpy()
+                z_outlier_3m = int((np.abs(z_vals) > 3.0).sum())
+                z_p99 = float(np.percentile(np.abs(z_vals), 99))
+                z_max = float(np.abs(z_vals).max())
+
+                diag_metrics = {
+                    "diag/z_outlier_count_3m": z_outlier_3m,
+                    "diag/z_abs_p99": z_p99,
+                    "diag/z_abs_max": z_max,
+                    "diag/gaussian_count": len(z_vals),
+                }
+                if xyz_grad is not None:
+                    # Per-axis gradient magnitude: key test for P12
+                    grad_x = xyz_grad[:, 0].abs().mean().item()
+                    grad_y = xyz_grad[:, 1].abs().mean().item()
+                    grad_z = xyz_grad[:, 2].abs().mean().item()
+                    diag_metrics.update({
+                        "diag/grad_x_mean": grad_x,
+                        "diag/grad_y_mean": grad_y,
+                        "diag/grad_z_mean": grad_z,
+                        # Z vs X ratio: P12 predicts this ~0.094 for horizontal cameras
+                        "diag/grad_z_vs_x_ratio": grad_z / (grad_x + 1e-10),
+                        "diag/grad_z_vs_x_ratio_log": float(np.log10(grad_z / (grad_x + 1e-10) + 1e-10)),
+                    })
+                wandb_logger.log(diag_metrics, step=iteration)
+
+            gaussian_metrics_log_interval = int(getattr(opt, "gaussian_metrics_log_interval", 2000))
+            should_log_gaussians = (
+                gaussian_metrics_log_interval > 0
+                and (iteration % gaussian_metrics_log_interval == 0 or iteration == opt.iterations)
+            )
+            if should_log_gaussians:
+                gaussian_summary = summarize_gaussians(
+                    gaussians,
+                    sparse_points=sparse_points,
+                    low_opacity_threshold=float(getattr(opt, "low_opacity_threshold", 0.1)),
+                    large_scale_threshold=float(getattr(opt, "large_scale_threshold", 0.1)),
+                )
+                save_gaussian_summary(
+                    gaussian_summary,
+                    Path(dataset.model_path) / "gaussian_metrics" / f"iteration_{iteration}.json",
+                )
+                if wandb_logger and wandb_logger.enabled:
+                    wandb_logger.log(gaussian_summary, step=iteration)
 
             # 정해진 주기마다 TensorBoard 로깅 및 PSNR 평가, 그리고 .ply 모델 저장을 수행합니다.
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+                if getattr(gaussians, "split_log", None):
+                    import numpy as _np, pickle as _pk
+                    with open(os.path.join(scene.model_path, "split_events.pkl"), "wb") as _f:
+                        _pk.dump(gaussians.split_log, _f)
 
             # --- 핵심: Densification (밀도 제어) 구간 ---
             # 특정 이터레이션(보통 15,000)까지만 포인트 개수를 늘리거나 줄입니다.
+            densify_happened = False
             if iteration < opt.densify_until_iter:
                 # 가지치기(Pruning)를 위해 각 가우시안이 2D 화면상에서 가졌던 최대 반지름을 기록합니다.
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 # 위치(XYZ) 변화에 대한 기울기(Gradient)를 누적합니다. (어느 부분이 부족한지 파악)
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                # 누적 가시성 카운터 업데이트
+                gaussians.accum_visibility[visibility_filter] += 1
 
                 # 일정 주기(densification_interval)마다 실제로 가우시안을 쪼개거나(Split/Clone) 지웁니다(Prune).
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                    densify_happened = True
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     # 기울기가 큰(복잡한) 곳은 나누고, 투명도(Opacity)가 너무 낮거나 너무 커진 가우시안은 제거합니다.
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    gaussians.densify_and_prune(
+                        opt.densify_grad_threshold,
+                        opt.min_opacity_prune_threshold,
+                        scene.cameras_extent,
+                        size_threshold,
+                        radii,
+                        iteration=iteration
+                    )
+                    # N changed → invalidate cyclic sampler permutation
+                    plateau_loss.reset_sampler()
                 # 가우시안이 구름처럼 퍼지는 현상(Floaters)을 막기 위해 주기적으로 투명도를 리셋(낮춤)합니다. -> 0으로 낮춰서 floater가 이미지에 큰 영향을 주도록...
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+
+            # Pop-2 Z-clip: run after densification so Gaussian count is consistent
+            plateau_metrics.update(plateau_loss.post_backward(gaussians, iteration))
+
+            # Carve loss: birth gate + budget prune (N이 바뀌면 plateau sampler 무효화)
+            _carve_pb = carve_loss.post_backward(gaussians, iteration, densify_happened)
+            carve_metrics.update(_carve_pb)
+            if _carve_pb.get("carve/gate_pruned", 0) or _carve_pb.get("carve/budget_pruned", 0):
+                plateau_loss.reset_sampler()
 
             # Optimizer Step (실제 파라미터 업데이트)
             if iteration < opt.iterations:
@@ -426,6 +622,14 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     # 이전에 저장해둔 .pth 체크포인트 파일 경로를 입력하면, 해당 시점부터 이어서 학습(Resume)합니다.
 
+    parser.add_argument("--plateau_loss_config", type=str, default=None,
+                        help="Path to plateau loss YAML config. None = disabled. "
+                             "Example: configs/plateau_loss/spherical.yaml")
+
+    parser.add_argument("--carve_loss_config", type=str, default=None,
+                        help="Path to carve loss YAML config. None = disabled. "
+                             "Example: configs/carve_loss/exp38_carve.yaml")
+
     # -------------------------------------------------------------------------
     # REVIEW: 인자 파싱 및 학습 준비
     # -------------------------------------------------------------------------
@@ -448,7 +652,9 @@ if __name__ == "__main__":
 
     # 실제 학습을 수행하는 메인 함수 호출. 
     # 파서에서 그룹별로 추출한(extract) 파라미터 묶음들과 리스트 형태의 반복 주기들을 넘겨줍니다.
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from,
+             plateau_loss_config=args.plateau_loss_config,
+             carve_loss_config=args.carve_loss_config)
 
     # All done
     print("\nTraining complete.")

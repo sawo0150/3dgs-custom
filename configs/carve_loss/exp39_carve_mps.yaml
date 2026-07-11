@@ -1,0 +1,31 @@
+# exp39: Carve Loss MPS 트랙 (exp08 데이터셋, 626k semidense anchor)
+# exp38(ORB)과 동일 설계 + MPS 대응: 타깃 다운샘플·anchor terminal 검증
+# (MPS anchor의 7.6%가 terminal 증거 없는 outlier — 허공 합법화 차단 필수)
+
+enabled: true
+
+voxel: 0.10
+ray_step: 0.06
+surf_margin: 0.20
+term_k: 3.0
+smooth: 3
+d5_tau: 0.25
+maxop_radius: 0.05
+cam_stride: 2
+target_voxel: 0.10
+anchor_term_min: 10
+
+soft_enabled: true
+lambda_carve: 0.05
+soft_start_iter: 1000
+score_min: 0.3
+
+prune_enabled: true
+prune_start_iter: 7000
+prune_interval: 1000
+budget_per_cycle: 0.0005
+budget_total: 0.0075   # 런타임 예산의 ~30%는 floater 기여가 소모 → 실제 표면 harm ≈ 0.5% (보정 07-11)
+prune_score_min: 0.3
+
+gate_enabled: true
+gate_score: 0.95
