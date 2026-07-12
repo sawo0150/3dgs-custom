@@ -82,6 +82,8 @@ class CarveLossConfig:
     target_voxel: float = 0.0    # >0이면 ray 타깃을 voxel 다운샘플 (MPS 626k → ~190k)
     anchor_term_min: float = 0.0 # >0이면 terminal 증거가 이 값 이하인 anchor를 d5에서 제외
                                  # (MPS semidense의 outlier 7.6%가 허공을 합법화하는 것 차단)
+    points_txt: str = ""         # 지정 시 source_path 대신 이 points3D.txt를 SLAM anchor로 사용
+                                 # (dense-init 데이터셋에서 원본 sparse SLAM 포인트를 써야 할 때 필수)
     img_w: int = 1024
     img_h: int = 1024
     fx: float = 500.0
@@ -119,6 +121,11 @@ class CarveLossConfig:
     force_score_min: float = 0.5
     force_start_iter: int = 1000
 
+    # Dynamic carve (exp45b): 가시 gaussian 점유를 terminal 증거에 주기 반영 —
+    # 재구성이 진행되며 표면이 확정되는 곳의 rho가 낮아져 score 오분류(feature-poor 표면) 자동 완화.
+    dynamic_carve: bool = False
+    dyn_occ_weight: float = 30.0   # 가시 gaussian 1개가 더하는 terminal 증거량
+
     @staticmethod
     def from_yaml(path: str) -> "CarveLossConfig":
         assert _YAML_OK, "PyYAML required"
@@ -143,7 +150,7 @@ class CarveLoss:
             return
         assert _SCIPY_OK, "scipy required for CarveLoss"
 
-        slam = _load_points3d(source_path)
+        slam = _load_points3d(source_path) if not cfg.points_txt else _load_points3d_file(cfg.points_txt)
         Rs, ts = _load_cameras(source_path)
         targets = slam
         if cfg.target_voxel > 0:
@@ -173,6 +180,8 @@ class CarveLoss:
 
         self._rho = torch.tensor(rho, dtype=torch.float32, device="cuda")
         self._terminal_np = terminal   # phi attractor 구성용 (CPU 보관)
+        self._transit_s = torch.tensor(transit, dtype=torch.float32, device="cuda")
+        self._terminal_s = torch.tensor(terminal, dtype=torch.float32, device="cuda")
         self._lo = torch.tensor(lo, dtype=torch.float32, device="cuda")
         self._dims = torch.tensor(np.asarray(dims), dtype=torch.long, device="cuda")
         self._slam_tree = cKDTree(slam)
@@ -205,6 +214,18 @@ class CarveLoss:
         with torch.no_grad():
             xyz = gaussians.get_xyz.detach()
             opac = gaussians.get_opacity.detach()[:, 0]
+            if self.cfg.dynamic_carve:
+                # 가시 gaussian 점유를 terminal에 가산 → rho grid 재계산
+                vis = xyz[opac > 0.3]
+                gi = torch.floor((vis - self._lo) / self.cfg.voxel).long()
+                inb = ((gi >= 0) & (gi < self._dims)).all(dim=1)
+                gi = gi[inb]
+                occ = torch.zeros_like(self._terminal_s)
+                if gi.shape[0] > 0:
+                    flat = (gi[:, 0] * self._dims[1] + gi[:, 1]) * self._dims[2] + gi[:, 2]
+                    occ.view(-1).scatter_add_(0, flat, torch.full((flat.shape[0],), self.cfg.dyn_occ_weight, device="cuda"))
+                term_dyn = self._terminal_s + occ
+                self._rho = self._transit_s / (self._transit_s + self.cfg.term_k * term_dyn + 1e-6)
             rho = self._rho_at(xyz)
             xyz_np = xyz.cpu().numpy()
             d5, _ = self._slam_tree.query(xyz_np, k=5, workers=-1)
@@ -294,6 +315,10 @@ class CarveLoss:
         """Birth gate + budget prune.  Call inside torch.no_grad() after densify."""
         if not self._ready:
             return {}
+        # no-densify 모드(densify_until_iter=0)에서는 tmp_radii가 생성되지 않아
+        # prune_points가 AttributeError — 방어적 초기화 (pitfalls의 tmp_radii 함정)
+        if not hasattr(gaussians, "tmp_radii"):
+            gaussians.tmp_radii = None
         cfg = self.cfg
         metrics: Dict = {}
 
@@ -363,8 +388,12 @@ def _load_cameras(source_path: str):
 
 
 def _load_points3d(source_path: str) -> np.ndarray:
+    return _load_points3d_file(str(Path(source_path) / "sparse/0/points3D.txt"))
+
+
+def _load_points3d_file(path: str) -> np.ndarray:
     pts = []
-    for line in open(Path(source_path) / "sparse/0/points3D.txt"):
+    for line in open(path):
         if line.startswith("#") or not line.strip():
             continue
         tok = line.split()

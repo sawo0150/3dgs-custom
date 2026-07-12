@@ -189,8 +189,26 @@ class GaussianModel:
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
 
+        # exp44e3: 외부 init 속성(per-point scale/rot) 주입 — CARVE_INIT_ATTRS=<npz> 환경변수
+        #   npz: scales (N,3, metric) / rots (N,4, wxyz 단위쿼터니언). N 불일치 시 무시.
+        import os as _os
+        _attrs_path = _os.environ.get("CARVE_INIT_ATTRS", "")
+        _ext_rots = None
+        if _attrs_path and _os.path.exists(_attrs_path):
+            _a = np.load(_attrs_path)
+            if len(_a["scales"]) == fused_point_cloud.shape[0]:
+                scales = torch.log(torch.clamp(
+                    torch.tensor(_a["scales"], dtype=torch.float32, device="cuda"), 1e-4, 1.0))
+                if "rots" in _a:
+                    _ext_rots = torch.tensor(_a["rots"], dtype=torch.float32, device="cuda")
+                print(f"[init] 외부 init 속성 적용: {_attrs_path} (N={len(_a['scales'])})")
+            else:
+                print(f"[init] CARVE_INIT_ATTRS N 불일치({len(_a['scales'])} vs {fused_point_cloud.shape[0]}) — 무시")
+
         # 초기 회전은 변환 없음(Identity 쿼터니언 [1,0,0,0])
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        if _ext_rots is not None:
+            rots = _ext_rots.clone()
         rots[:, 0] = 1
 
         # 초기 투명도는 0.1로 옅게 시작합니다. (inverse_sigmoid 적용하여 저장)
