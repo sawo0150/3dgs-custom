@@ -1,0 +1,11 @@
+name: mavis_301_1253
+source_path: /home/wosas/Desktop/Incremental_mapping_test/gs_floaterLab/data/rgb_3dgs_openmavis_batch_301_1253
+images: images
+model_path: null
+depths: ""
+resolution: -1
+white_background: false
+eval: false
+train_test_exp: false
+data_device: cuda
+manifest_path: null

@@ -98,21 +98,54 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            # Extra tracking buffers for incremental history preservation
+            self.ancestor_idx,
+            self.birth_step,
+            self.generation,
+            self.num_splits,
+            self.num_clones,
+            self.accum_visibility,
+            self.accum_rgb_grad,
+            self.accum_rgb_grad_vec,
+            self.accum_plateau_grad
         )
     
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._features_dc, 
-        self._features_rest,
-        self._scaling, 
-        self._rotation, 
-        self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
-        denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
+        if len(model_args) > 12:
+            (self.active_sh_degree, 
+            self._xyz, 
+            self._features_dc, 
+            self._features_rest,
+            self._scaling, 
+            self._rotation, 
+            self._opacity,
+            self.max_radii2D, 
+            xyz_gradient_accum, 
+            denom,
+            opt_dict, 
+            self.spatial_lr_scale,
+            self.ancestor_idx,
+            self.birth_step,
+            self.generation,
+            self.num_splits,
+            self.num_clones,
+            self.accum_visibility,
+            self.accum_rgb_grad,
+            self.accum_rgb_grad_vec,
+            self.accum_plateau_grad) = model_args
+        else:
+            (self.active_sh_degree, 
+            self._xyz, 
+            self._features_dc, 
+            self._features_rest,
+            self._scaling, 
+            self._rotation, 
+            self._opacity,
+            self.max_radii2D, 
+            xyz_gradient_accum, 
+            denom,
+            opt_dict, 
+            self.spatial_lr_scale) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -194,16 +227,22 @@ class GaussianModel:
         import os as _os
         _attrs_path = _os.environ.get("CARVE_INIT_ATTRS", "")
         _ext_rots = None
+        _ext_opacity = None
         if _attrs_path and _os.path.exists(_attrs_path):
             _a = np.load(_attrs_path)
-            if len(_a["scales"]) == fused_point_cloud.shape[0]:
+            _n0 = fused_point_cloud.shape[0]
+            if "scales" in _a and len(_a["scales"]) == _n0:
                 scales = torch.log(torch.clamp(
                     torch.tensor(_a["scales"], dtype=torch.float32, device="cuda"), 1e-4, 1.0))
                 if "rots" in _a:
                     _ext_rots = torch.tensor(_a["rots"], dtype=torch.float32, device="cuda")
-                print(f"[init] 외부 init 속성 적용: {_attrs_path} (N={len(_a['scales'])})")
-            else:
-                print(f"[init] CARVE_INIT_ATTRS N 불일치({len(_a['scales'])} vs {fused_point_cloud.shape[0]}) — 무시")
+                print(f"[init] 외부 init 속성 적용: {_attrs_path} (N={_n0})")
+            # exp46 축3: per-point 초기 opacity (표면-확신 점은 높게 시작 → 잔차 선점)
+            if "opacity" in _a and len(_a["opacity"]) == _n0:
+                _ext_opacity = torch.tensor(_a["opacity"], dtype=torch.float32, device="cuda").clamp(1e-3, 0.99)
+                print(f"[init] 외부 init opacity 적용 (표면-확신 init, N={_n0})")
+            if ("scales" in _a and len(_a["scales"]) != _n0):
+                print(f"[init] CARVE_INIT_ATTRS N 불일치({len(_a['scales'])} vs {_n0}) — scale/rot 무시")
 
         # 초기 회전은 변환 없음(Identity 쿼터니언 [1,0,0,0])
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
@@ -212,7 +251,10 @@ class GaussianModel:
         rots[:, 0] = 1
 
         # 초기 투명도는 0.1로 옅게 시작합니다. (inverse_sigmoid 적용하여 저장)
-        opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        if _ext_opacity is not None:
+            opacities = self.inverse_opacity_activation(_ext_opacity.view(-1, 1))
+        else:
+            opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
         # 모든 텐서를 nn.Parameter로 감싸서 PyTorch가 역전파(Backprop)로 값을 업데이트할 수 있게(requires_grad=True) 만듭니다.
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
@@ -236,6 +278,54 @@ class GaussianModel:
         self.pretrained_exposures = None
         exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
+
+    def add_extra_points(self, pcd : BasicPointCloud):
+        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
+        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features[:, :3, 0 ] = fused_color
+        features[:, 3:, 1:] = 0.0
+
+        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots[:, 0] = 1
+
+        opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+
+        d = {
+            "xyz": fused_point_cloud,
+            "f_dc": features[:, :, 0:1].transpose(1, 2).contiguous(),
+            "f_rest": features[:, :, 1:].transpose(1, 2).contiguous(),
+            "opacity": opacities,
+            "scaling": scales,
+            "rotation": rots
+        }
+
+        optimizable_tensors = self.cat_tensors_to_optimizer(d)
+        self._xyz = optimizable_tensors["xyz"]
+        self._features_dc = optimizable_tensors["f_dc"]
+        self._features_rest = optimizable_tensors["f_rest"]
+        self._opacity = optimizable_tensors["opacity"]
+        self._scaling = optimizable_tensors["scaling"]
+        self._rotation = optimizable_tensors["rotation"]
+
+        num_pts = fused_point_cloud.shape[0]
+        self.max_radii2D = torch.cat((self.max_radii2D, torch.zeros(num_pts, device="cuda")))
+        self.ancestor_idx = torch.cat((self.ancestor_idx, torch.arange(self.ancestor_idx.shape[0], self.ancestor_idx.shape[0] + num_pts, dtype=torch.long, device="cuda")))
+        self.birth_step = torch.cat((self.birth_step, torch.zeros(num_pts, dtype=torch.int, device="cuda")))
+        self.generation = torch.cat((self.generation, torch.zeros(num_pts, dtype=torch.int, device="cuda")))
+        self.num_splits = torch.cat((self.num_splits, torch.zeros(num_pts, dtype=torch.int, device="cuda")))
+        self.num_clones = torch.cat((self.num_clones, torch.zeros(num_pts, dtype=torch.int, device="cuda")))
+        self.accum_visibility = torch.cat((self.accum_visibility, torch.zeros(num_pts, dtype=torch.int, device="cuda")))
+        self.accum_rgb_grad = torch.cat((self.accum_rgb_grad, torch.zeros(num_pts, dtype=torch.float, device="cuda")))
+        self.accum_rgb_grad_vec = torch.cat((self.accum_rgb_grad_vec, torch.zeros(num_pts, 3, dtype=torch.float, device="cuda")))
+        self.accum_plateau_grad = torch.cat((self.accum_plateau_grad, torch.zeros(num_pts, dtype=torch.float, device="cuda")))
+        
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        print("Concatenated new points to optimizer. Total points: ", self.get_xyz.shape[0])
 
     # -------------------------------------------------------------------------
     # REVIEW: 4. 학습 준비 및 파라미터별 Optimizer 설정

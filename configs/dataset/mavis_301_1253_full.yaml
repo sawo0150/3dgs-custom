@@ -1,0 +1,13 @@
+name: mavis_301_1253_full
+source_path: /home/wosas/Desktop/Incremental_mapping_test/orb_gs_bridge/repos/2dgs/datasets/aria_mps_2dgs/0416_Data__0416_301-1253
+images: images
+model_path: null
+depths: ""
+resolution: -1
+white_background: false
+eval: false
+train_test_exp: false
+data_device: cpu
+manifest_path: null
+init_pcd_filter: false
+init_pcd_expand_factor: 3.0

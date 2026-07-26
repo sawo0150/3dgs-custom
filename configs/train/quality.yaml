@@ -18,10 +18,20 @@ opacity_reset_interval: 3000
 densify_from_iter: 500
 densify_until_iter: 15000
 densify_grad_threshold: 0.0002
+min_opacity_prune_threshold: 0.005
 depth_l1_weight_init: 1.0
 depth_l1_weight_final: 0.01
+sparse_depth_weight_init: 0.0
+sparse_depth_weight_final: 0.0
+sparse_depth_max_points: 2048
+sparse_depth_global_max_points: 100000
+sparse_depth_min_depth: 0.2
+sparse_depth_require_rendered: true
 random_background: false
 optimizer_type: default
+optimizer_beta1: 0.9
+optimizer_beta2: 0.999
+softmax_depth_beta: 5.0
 
 debug_from: -1
 detect_anomaly: false

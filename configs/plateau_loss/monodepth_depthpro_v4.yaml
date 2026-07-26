@@ -1,0 +1,31 @@
+# Candidate D — Ellipsoidal plateau + Depth Pro virtual anchors (v4, D_target=0.50m)
+# exp18: python train.py ... --plateau_loss_config configs/plateau_loss/monodepth_depthpro_v4.yaml
+#
+# Anchors: SLAM 6,492 + Depth Pro virtual anchors (v4 결과)
+# L1 coverage: 0.00% (Depth Pro 하부 불안정) → L2-L7 일관성 높음
+# See: results/diagnostic/plateau_ellipsoid_v4_20260705_041132/
+
+enabled: true
+type: ellipsoidal
+
+anchor_path: /home/wosas/Desktop/Incremental_mapping_test/gs_floaterLab/results/diagnostic/plateau_ellipsoid_v4_20260705_041132/anchors_all_depth_pro.npy
+obs_min: 0
+
+knn_k: 5
+knn_iso_mult: 0     # disabled: virtual anchors already uniformly spaced
+
+alpha_n: 0.4
+alpha_t: 0.9
+tau_min: 0.03
+tau_n_max: 0.30
+tau_t_max: 0.60
+
+start_iter: 5000
+lambda_plateau: 0.01
+
+sample_size: 8192
+
+pop2_zclip: true
+pop2_z_threshold: 2.0
+pop2_start_iter: 5000
+pop2_interval: 1000

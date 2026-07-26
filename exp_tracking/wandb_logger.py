@@ -45,6 +45,10 @@ class WandbLogger:
         if self.enabled and self.run is not None:
             self.run.log({name: self._wandb.Image(image_path, caption=caption)})
 
+    def log_tensor_image(self, name: str, image, caption: Optional[str] = None, step: Optional[int] = None) -> None:
+        if self.enabled and self.run is not None:
+            self.run.log({name: self._wandb.Image(image, caption=caption)}, step=step)
+
     def log_artifact_path(self, path: str, name: str, artifact_type: str = "dataset") -> None:
         if self.enabled and self.run is not None:
             art = self._wandb.Artifact(name=name, type=artifact_type)

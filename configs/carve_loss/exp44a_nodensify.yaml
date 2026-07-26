@@ -1,0 +1,26 @@
+# exp44a: dense init × no-densify × carve (단축 스케줄용)
+# densification이 없으므로 gate 불필요, prune은 이른 시점부터 짧은 주기로.
+enabled: true
+voxel: 0.10
+ray_step: 0.06
+surf_margin: 0.20
+term_k: 3.0
+smooth: 3
+d5_tau: 0.25
+maxop_radius: 0.05
+points_txt: /home/wosas/Desktop/Incremental_mapping_test/gs_floaterLab/data/03_rgb_3dgs_full/sparse/0/points3D.txt
+
+soft_enabled: true
+lambda_carve: 0.02
+soft_start_iter: 500
+score_min: 0.5
+
+prune_enabled: true
+prune_start_iter: 1000
+prune_interval: 500
+budget_per_cycle: 0.001
+budget_total: 0.0075
+prune_score_min: 0.3
+
+gate_enabled: false
+force_enabled: false

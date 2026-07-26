@@ -10,9 +10,10 @@ from omegaconf import DictConfig, OmegaConf
 MODEL_KEYS = [
     "sh_degree", "source_path", "model_path", "images", "depths", "resolution",
     "white_background", "train_test_exp", "data_device", "eval",
+    "init_pcd_filter", "init_pcd_expand_factor",
 ]
 PIPELINE_KEYS = [
-    "convert_SHs_python", "compute_cov3D_python", "debug", "antialiasing",
+    "convert_SHs_python", "compute_cov3D_python", "debug", "antialiasing", "beta",
 ]
 OPT_KEYS = [
     "iterations", "position_lr_init", "position_lr_final", "position_lr_delay_mult",
@@ -20,8 +21,11 @@ OPT_KEYS = [
     "exposure_lr_init", "exposure_lr_final", "exposure_lr_delay_steps",
     "exposure_lr_delay_mult", "percent_dense", "lambda_dssim", "densification_interval",
     "opacity_reset_interval", "densify_from_iter", "densify_until_iter",
-    "densify_grad_threshold", "depth_l1_weight_init", "depth_l1_weight_final",
-    "random_background", "optimizer_type",
+    "densify_grad_threshold", "min_opacity_prune_threshold", "depth_l1_weight_init",
+    "depth_l1_weight_final", "sparse_depth_weight_init", "sparse_depth_weight_final",
+    "sparse_depth_max_points", "sparse_depth_global_max_points", "sparse_depth_min_depth",
+    "sparse_depth_require_rendered", "random_background", "optimizer_type",
+    "optimizer_beta1", "optimizer_beta2",
 ]
 
 
@@ -45,6 +49,8 @@ def build_legacy_groups(cfg: DictConfig) -> Tuple[SimpleNamespace, SimpleNamespa
         "train_test_exp": dataset.get("train_test_exp", False),
         "data_device": dataset.get("data_device", "cuda"),
         "eval": dataset.get("eval", False),
+        "init_pcd_filter": dataset.get("init_pcd_filter", False),
+        "init_pcd_expand_factor": float(dataset.get("init_pcd_expand_factor", 3.0)),
     }
 
     pipe_src = {
@@ -52,6 +58,7 @@ def build_legacy_groups(cfg: DictConfig) -> Tuple[SimpleNamespace, SimpleNamespa
         "compute_cov3D_python": False,
         "debug": False,
         "antialiasing": False,
+        "beta": float(train.get("softmax_depth_beta", 5.0)),
     }
 
     model_args = _namespace_from_keys(model_src, MODEL_KEYS)
@@ -89,3 +96,8 @@ def inject_runtime_args(cfg: DictConfig, model_args: SimpleNamespace, opt_args: 
     setattr(opt_args, "viewer_enabled", bool(cfg.viewer.get("enabled", False)))
     setattr(opt_args, "viewer_ip", str(cfg.viewer.get("ip", "127.0.0.1")))
     setattr(opt_args, "viewer_port", int(cfg.viewer.get("port", 6009)))
+    setattr(opt_args, "ambiguity_log_interval", int(cfg.logging.get("ambiguity_log_interval", 2000)))
+    setattr(opt_args, "gaussian_metrics_log_interval", int(cfg.logging.get("gaussian_metrics_log_interval", 2000)))
+    setattr(opt_args, "low_opacity_threshold", float(cfg.logging.get("low_opacity_threshold", 0.1)))
+    setattr(opt_args, "large_scale_threshold", float(cfg.logging.get("large_scale_threshold", 0.1)))
+    setattr(opt_args, "diag_grad_interval", int(cfg.logging.get("diag_grad_interval", 500)))

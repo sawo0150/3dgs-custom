@@ -1,0 +1,33 @@
+# Candidate C — Ellipsoidal plateau + Metric3D virtual anchors (v4, D_target=0.50m)
+# exp17: python train.py ... --plateau_loss_config configs/plateau_loss/monodepth_metric3d_v4.yaml
+#
+# Anchors: 9,110 pts = 6,492 SLAM + 2,618 Metric3D virtual (voxel seeding D_target=0.50m)
+# Covers L8 (Pop-2 zone): 29.81% vs 0% SLAM-only
+# See: results/diagnostic/plateau_ellipsoid_v4_20260705_041132/
+
+enabled: true
+type: ellipsoidal
+
+anchor_path: /home/wosas/Desktop/Incremental_mapping_test/gs_floaterLab/results/diagnostic/plateau_ellipsoid_v4_20260705_041132/anchors_all_metric3d.npy
+obs_min: 0          # ignored when anchor_path is set
+
+knn_k: 5
+knn_iso_mult: 0     # disabled: virtual anchors already uniformly spaced
+
+alpha_n: 0.4
+alpha_t: 0.9
+tau_min: 0.03
+tau_n_max: 0.30
+tau_t_max: 0.60
+
+start_iter: 5000
+lambda_plateau: 0.01
+
+sample_size: 8192
+
+# Pop-2 Z-clip still needed: plateau loss alone won't stop gradient from pushing
+# new Gaussians upward; clip removes them before they settle
+pop2_zclip: true
+pop2_z_threshold: 2.0
+pop2_start_iter: 5000
+pop2_interval: 1000

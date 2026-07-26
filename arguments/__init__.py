@@ -69,6 +69,7 @@ class PipelineParams(ParamGroup):
         self.compute_cov3D_python = False
         self.debug = False
         self.antialiasing = False
+        self.beta = 5.0
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
@@ -93,10 +94,23 @@ class OptimizationParams(ParamGroup):
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
+        self.min_opacity_prune_threshold = 0.005
         self.depth_l1_weight_init = 1.0
         self.depth_l1_weight_final = 0.01
+        self.sparse_depth_weight_init = 0.0
+        self.sparse_depth_weight_final = 0.0
+        self.sparse_depth_max_points = 2048
+        self.sparse_depth_global_max_points = 100000
+        self.sparse_depth_min_depth = 0.2
+        self.sparse_depth_require_rendered = True
         self.random_background = False
         self.optimizer_type = "default"
+        self.optimizer_beta1 = 0.9
+        self.optimizer_beta2 = 0.999
+        self.ambiguity_log_interval = 2000
+        self.gaussian_metrics_log_interval = 2000
+        self.low_opacity_threshold = 0.1
+        self.large_scale_threshold = 0.1
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

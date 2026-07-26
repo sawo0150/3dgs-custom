@@ -1,0 +1,35 @@
+# exp21: MPS init + DepthPro anchors + opacity-weighted loss + strong lambda
+#
+# Key changes vs exp19/20:
+#   1. opacity_weight=true  → high-opacity floaters get gradient on xyz AND opacity
+#      (floaters either move to surface OR become transparent → pruned)
+#   2. start_iter=7000      → after densification, don't fight it
+#   3. lambda=0.1           → strong but now targeted (surface Gaussians mostly inside plateau)
+#   4. no schedule turnoff  → loss naturally decays as floaters disappear
+
+enabled: true
+type: ellipsoidal
+
+anchor_path: /home/wosas/Desktop/Incremental_mapping_test/gs_floaterLab/results/diagnostic/plateau_ellipsoid_v4_20260705_041132/anchors_all_depth_pro.npy
+obs_min: 0
+
+knn_k: 5
+knn_iso_mult: 0
+
+alpha_n: 0.4
+alpha_t: 0.9
+tau_min: 0.03
+tau_n_max: 0.30
+tau_t_max: 0.60
+
+start_iter: 7000
+lambda_plateau: 0.10
+
+opacity_weight: true
+
+sample_size: 8192
+
+pop2_zclip: true
+pop2_z_threshold: 2.0
+pop2_start_iter: 7000
+pop2_interval: 1000

@@ -1,0 +1,37 @@
+# exp20: MPS init + DepthPro anchors + 2-phase lambda schedule
+# Goal: strong pull → plateau fast, then photometric loss takes over
+#
+# Schedule:
+#   iter 1000-7000:  lambda=0.10  (strong: during densification, pull Gaussians in)
+#   iter 7000-15000: lambda=0.03  (medium: post-densification, maintain)
+#   iter 15000+:     lambda=0.00  (off: photometric loss only)
+
+enabled: true
+type: ellipsoidal
+
+anchor_path: /home/wosas/Desktop/Incremental_mapping_test/gs_floaterLab/results/diagnostic/plateau_ellipsoid_v4_20260705_041132/anchors_all_depth_pro.npy
+obs_min: 0
+
+knn_k: 5
+knn_iso_mult: 0
+
+alpha_n: 0.4
+alpha_t: 0.9
+tau_min: 0.03
+tau_n_max: 0.30
+tau_t_max: 0.60
+
+start_iter: 1000
+lambda_plateau: 0.10
+
+lambda_schedule:
+  - [1000, 0.10]
+  - [7000, 0.03]
+  - [15000, 0.00]
+
+sample_size: 8192
+
+pop2_zclip: true
+pop2_z_threshold: 2.0
+pop2_start_iter: 5000
+pop2_interval: 1000

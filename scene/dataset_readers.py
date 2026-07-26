@@ -63,6 +63,8 @@ def getNerfppNorm(cam_info):
 
     center, diagonal = get_center_and_diag(cam_centers)
     radius = diagonal * 1.1
+    if radius == 0.0:
+        radius = 3.0 # Fallback for single camera view datasets (incremental chunks)
 
     translate = -center
 
@@ -142,7 +144,64 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
+def _filter_pcd_by_camera_bound(pcd, cam_infos, expand_factor=3.0):
+    """
+    Filter sparse points to within expand_factor × camera extent.
+    Removes SLAM triangulation outliers at extreme coordinates.
+    Returns filtered BasicPointCloud and stats dict.
+    """
+    if pcd is None or len(pcd.points) == 0:
+        return pcd, {}
+
+    # Camera centers from cam_infos (T is translation in camera space: C = -R.T @ T)
+    cam_centers = []
+    for ci in cam_infos:
+        # ci.R = np.transpose(qvec2rotmat(qvec)) = R_cam2world (camera-to-world rotation)
+        # ci.T = tvec (world-to-camera translation)
+        # Camera center in world: C = -R_cam2world @ T
+        C = -ci.R @ ci.T
+        cam_centers.append(C)
+    cam_centers = np.array(cam_centers)  # [N_cam, 3]
+
+    cam_min = cam_centers.min(axis=0)
+    cam_max = cam_centers.max(axis=0)
+    cam_span = cam_max - cam_min  # [3]
+    # Per-axis minimum margins: XY=2m (horizontal), Z=3m (floor-to-ceiling)
+    min_margin = np.array([2.0, 2.0, 3.0])
+    margin = np.maximum(cam_span * expand_factor, min_margin)
+
+    lo = cam_min - margin
+    hi = cam_max + margin
+
+    pts = np.array(pcd.points)
+    valid = (
+        (pts[:, 0] >= lo[0]) & (pts[:, 0] <= hi[0]) &
+        (pts[:, 1] >= lo[1]) & (pts[:, 1] <= hi[1]) &
+        (pts[:, 2] >= lo[2]) & (pts[:, 2] <= hi[2])
+    )
+
+    n_total = len(pts)
+    n_valid = valid.sum()
+    n_removed = n_total - n_valid
+
+    print(f"[init_pcd_filter] Camera extent: X[{cam_min[0]:.2f},{cam_max[0]:.2f}] "
+          f"Y[{cam_min[1]:.2f},{cam_max[1]:.2f}] Z[{cam_min[2]:.2f},{cam_max[2]:.2f}]")
+    print(f"[init_pcd_filter] Filter bounds (×{expand_factor}): "
+          f"X[{lo[0]:.2f},{hi[0]:.2f}] Y[{lo[1]:.2f},{hi[1]:.2f}] Z[{lo[2]:.2f},{hi[2]:.2f}]")
+    print(f"[init_pcd_filter] Removed {n_removed}/{n_total} points ({100*n_removed/n_total:.2f}%)")
+
+    filtered_pcd = BasicPointCloud(
+        points=pts[valid],
+        colors=np.array(pcd.colors)[valid],
+        normals=np.array(pcd.normals)[valid] if pcd.normals is not None else None,
+    )
+    stats = {"n_total": n_total, "n_removed": n_removed, "n_valid": n_valid,
+             "expand_factor": expand_factor, "lo": lo.tolist(), "hi": hi.tolist()}
+    return filtered_pcd, stats
+
+
+def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8,
+                        init_pcd_filter=False, init_pcd_expand_factor=3.0):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -216,6 +275,9 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
         pcd = fetchPly(ply_path)
     except:
         pcd = None
+
+    if init_pcd_filter and pcd is not None:
+        pcd, _ = _filter_pcd_by_camera_bound(pcd, train_cam_infos, expand_factor=init_pcd_expand_factor)
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,

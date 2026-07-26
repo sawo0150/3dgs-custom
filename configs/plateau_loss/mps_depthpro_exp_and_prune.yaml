@@ -1,0 +1,42 @@
+# exp24: MPS + DepthPro + exponential loss + opacity weight + adaptive pruning
+#
+# Combined full strategy:
+#   1) Adaptive pruning: confident floaters (d_euc>1.5m AND high opacity/scale) → prune
+#   2) Exp loss + opacity weight: remaining distant floaters → strong gradient
+# Expected: best of both worlds — direct removal for clear floaters,
+#            gradient-guided for ambiguous ones
+
+enabled: true
+type: ellipsoidal
+
+anchor_path: /home/wosas/Desktop/Incremental_mapping_test/gs_floaterLab/results/diagnostic/plateau_ellipsoid_v4_20260705_041132/anchors_all_depth_pro.npy
+obs_min: 0
+
+knn_k: 5
+knn_iso_mult: 0
+
+alpha_n: 0.4
+alpha_t: 0.9
+tau_min: 0.03
+tau_n_max: 0.30
+tau_t_max: 0.60
+
+start_iter: 7000
+lambda_plateau: 0.05
+
+opacity_weight: true
+exp_loss: true
+
+adaptive_prune: true
+adaptive_prune_d_euc: 1.5
+adaptive_prune_opacity: 0.5
+adaptive_prune_scale: 0.15
+adaptive_prune_interval: 500
+adaptive_prune_start_iter: 7000
+
+sample_size: 8192
+
+pop2_zclip: true
+pop2_z_threshold: 2.0
+pop2_start_iter: 7000
+pop2_interval: 1000

@@ -1,0 +1,32 @@
+# Candidate B — Ellipsoidal plateau (SLAM-only anchors, surface-aware)
+# exp16: python train.py ... --plateau_loss_config configs/plateau_loss/ellipsoidal.yaml
+#
+# tau_n = clip(0.4 * h_j, 0.03m, 0.30m)   normal direction  (tight)
+# tau_t = clip(0.9 * h_j, 0.03m, 0.60m)   tangent direction (loose)
+# u_n estimated via kNN-5 PCA (smallest eigenvalue)
+
+enabled: true
+type: ellipsoidal
+
+anchor_path: /home/wosas/Desktop/Incremental_mapping_test/gs_floaterLab/data/rgb_3dgs_openmavis_batch_301_1253/slam_anchors_filtered.npy
+obs_min: 0    # ignored: anchor_path already filtered
+
+knn_k: 5
+knn_iso_mult: 3.0
+
+# ellipsoidal tau
+alpha_n: 0.4
+alpha_t: 0.9
+tau_min: 0.03
+tau_n_max: 0.30
+tau_t_max: 0.60
+
+start_iter: 5000
+lambda_plateau: 0.01
+
+sample_size: 8192
+
+pop2_zclip: true
+pop2_z_threshold: 2.0
+pop2_start_iter: 5000
+pop2_interval: 1000

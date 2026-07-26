@@ -1,0 +1,35 @@
+# exp22: MPS + DepthPro + exponential loss kernel + opacity weight
+#
+# vs exp21 (quadratic opacity-weighted):
+#   exp_loss=true  → exp(clamp(D-1,0,8))-1 replaces (D-1)^2
+#                    D=5 gradient: 54.6x vs 8x (quadratic)
+#   lambda=0.05    → smaller (exp loss ~3-7x larger at typical D, so λ halved)
+#   start_iter=7000 → after densification ends
+
+enabled: true
+type: ellipsoidal
+
+anchor_path: /home/wosas/Desktop/Incremental_mapping_test/gs_floaterLab/results/diagnostic/plateau_ellipsoid_v4_20260705_041132/anchors_all_depth_pro.npy
+obs_min: 0
+
+knn_k: 5
+knn_iso_mult: 0
+
+alpha_n: 0.4
+alpha_t: 0.9
+tau_min: 0.03
+tau_n_max: 0.30
+tau_t_max: 0.60
+
+start_iter: 7000
+lambda_plateau: 0.05
+
+opacity_weight: true
+exp_loss: true
+
+sample_size: 8192
+
+pop2_zclip: true
+pop2_z_threshold: 2.0
+pop2_start_iter: 7000
+pop2_interval: 1000

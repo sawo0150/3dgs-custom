@@ -46,6 +46,7 @@ def run_legacy_training(dataset, opt, pipe, testing_iterations, saving_iteration
         checkpoint_iterations,
         checkpoint,
         debug_from,
+        wandb_logger=wandb_logger,
     )
 
     if wandb_logger and wandb_logger.enabled:

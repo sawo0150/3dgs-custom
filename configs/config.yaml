@@ -3,9 +3,9 @@ defaults:
   - pose: colmap
   - selection: pose_threshold
   - train: fast
-  - logging: off
+  - logging: "off"
   - runtime: offline
-  - viewer: off
+  - viewer: "off"
   - _self_
 
 project:

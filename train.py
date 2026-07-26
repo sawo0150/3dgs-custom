@@ -111,8 +111,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     # 이전에 멈춘 체크포인트(.pth)가 있다면 로드하여 학습 상태(iter, 파라미터)를 복원합니다.
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
+        
+        # 계측·계보 버퍼는 checkpoint에 없으면 복원된 gaussian 수에 맞춰 재생성
+        _n = gaussians._xyz.shape[0]
+        for _name, _shape in (("accum_rgb_grad", (_n,)), ("accum_rgb_grad_vec", (_n, 3)),
+                              ("accum_plateau_grad", (_n,)), ("accum_visibility", (_n,)),
+                              ("birth_step", (_n,)), ("generation", (_n,)),
+                              ("num_splits", (_n,)), ("num_clones", (_n,))):
+            if hasattr(gaussians, _name) and getattr(gaussians, _name).shape[0] != _n:
+                _old = getattr(gaussians, _name)
+                setattr(gaussians, _name, torch.zeros(_shape, dtype=_old.dtype, device="cuda"))
+        if hasattr(gaussians, "ancestor_idx") and gaussians.ancestor_idx.shape[0] != _n:
+            gaussians.ancestor_idx = torch.arange(_n, dtype=gaussians.ancestor_idx.dtype, device="cuda")
 
     # 배경색 설정 (데이터셋 옵션에 따라 흰색 또는 검은색)
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -239,6 +251,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # 픽셀 단위의 L1 Loss
         Ll1 = l1_loss(image, gt_image)
+
+        # exp46 축7: 원거리 photometric 감쇠 (env-gated, 미설정 시 기존 동작 그대로)
+        #   w(z) = 1/(1+(z/z0)^k), z0=장면별 round9 분위수(m). 먼 픽셀의 L1 보상↓ → 먼 floater 숏컷 약화.
+        _far_z0 = float(os.environ.get("FAR_ATTEN_Z0", "0"))
+        if _far_z0 > 0:
+            _far_k = float(os.environ.get("FAR_ATTEN_K", "4"))
+            _zmap = render_pkg["depth"].detach()               # [1,H,W]
+            _w = 1.0 / (1.0 + (_zmap.clamp(min=1e-3) / _far_z0) ** _far_k)
+            _w = _w / _w.mean().clamp(min=1e-6)                 # 스케일 보존(lambda_dssim 균형 유지)
+            Ll1 = (_w * torch.abs(image - gt_image)).mean()
+
+        # exp46 축7b (사용자): 최대 거리 하드 컷오프 — 렌더 깊이가 z_max보다 먼 픽셀은
+        #   1px footprint가 뭉개질 만큼 멀어 photometric 신호가 불신 → 그 픽셀 L1 제외.
+        #   (먼 gaussian이 개별 픽셀을 억지로 맞추다 floater 되는 것을 차단하는 취지)
+        _far_zmax = float(os.environ.get("FAR_ATTEN_ZMAX", "0"))
+        if _far_zmax > 0:
+            _zmap = render_pkg["depth"].detach()
+            _m = (_zmap < _far_zmax).float()                   # 가까운 픽셀만 1
+            _m = _m / _m.mean().clamp(min=1e-6)
+            Ll1 = (_m * torch.abs(image - gt_image)).mean()
         
         # 구조적 유사도(SSIM) Loss 계산 (FUSED_SSIM이 빠름)
         if FUSED_SSIM_AVAILABLE:

@@ -5,5 +5,10 @@ name: null
 tags: []
 mode: offline
 log_images_every: 1000
+ambiguity_log_interval: 2000
+gaussian_metrics_log_interval: 2000
+diag_grad_interval: 500
+low_opacity_threshold: 0.1
+large_scale_threshold: 0.1
 log_selection_table: false
 upload_artifacts: false

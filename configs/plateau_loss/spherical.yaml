@@ -1,0 +1,36 @@
+# Candidate A — Spherical plateau (SLAM-only anchors)
+# exp15: python train.py ... --plateau_loss_config configs/plateau_loss/spherical.yaml
+#
+# Anchors: auto-loaded from source_path/sparse/0/points3D.txt
+# tau_j = clip(0.6 * h_j, 0.05m, 0.60m)   h_j = kNN-5 distance
+# L = mean_n max(D_min(x_n) - 1, 0)^2
+
+enabled: true
+type: spherical
+
+# anchor source — explicit path to ORB-SLAM batch filtered anchors (6,492 pts)
+# (source_path가 MPS 626k full data라 null로 두면 MPS 포인트를 잡으므로 명시 지정)
+anchor_path: /home/wosas/Desktop/Incremental_mapping_test/gs_floaterLab/data/rgb_3dgs_openmavis_batch_301_1253/slam_anchors_filtered.npy
+obs_min: 0    # ignored: anchor_path already filtered (obs>=3 + kNN isolation)
+
+# kNN
+knn_k: 5
+knn_iso_mult: 3.0
+
+# tau
+alpha: 0.6
+tau_min: 0.05
+tau_max: 0.60
+
+# schedule
+start_iter: 5000
+lambda_plateau: 0.01
+
+# cyclic sampler
+sample_size: 8192
+
+# Pop-2 Z-clip
+pop2_zclip: true
+pop2_z_threshold: 2.0
+pop2_start_iter: 5000
+pop2_interval: 1000

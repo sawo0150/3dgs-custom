@@ -93,6 +93,7 @@ class CarveLossConfig:
 
     # Score refresh
     maxop_radius: float = 0.05
+    no_maxop_protection: bool = False  # exp43: score=w (가시 먼지 보호항 해제)
     refresh_interval: int = 200      # score staleness bound (also refreshed on N change)
 
     # Soft opacity loss
@@ -125,6 +126,19 @@ class CarveLossConfig:
     # 재구성이 진행되며 표면이 확정되는 곳의 rho가 낮아져 score 오분류(feature-poor 표면) 자동 완화.
     dynamic_carve: bool = False
     dyn_occ_weight: float = 30.0   # 가시 gaussian 1개가 더하는 terminal 증거량
+
+    # 축5 (exp46): densify 재유도 — score 높은(빈 공간) 신생아를 죽이는(gate) 대신
+    # 가장 가까운 표면 anchor로 즉시 스냅. "먼지가 먼지를 낳는 연쇄"를 "표면을 낳도록" 전환.
+    birth_redirect: bool = False
+    redirect_alpha: float = 0.7      # anchor 쪽으로 이동 비율 (1=완전 스냅)
+    redirect_score_min: float = 0.5  # 이 score 초과 신생아만 재유도
+
+    # Depth-violation 채널 (exp43 결과 14/15): 보정된 mono-depth 맵보다 카메라 쪽에
+    # 떠 있는 빈도(vr)를 score와 max 결합 — voxel field가 놓치는 fog·희소맵 장면의
+    # 가시 floater를 이미지 공간 신호로 포착 (12F AUC 0.858→0.908).
+    depth_dir: str = ""          # 보정 depth npy 디렉토리 (프레임 stem = 이미지 stem)
+    depth_scale: float = 1.0     # 추가 전역 스케일 (pose 자가 보정값 등)
+    vr_min_vis: int = 5          # 이 미만 프레임에서만 보이면 vr=0 (노이즈 억제)
 
     @staticmethod
     def from_yaml(path: str) -> "CarveLossConfig":
@@ -186,6 +200,32 @@ class CarveLoss:
         self._dims = torch.tensor(np.asarray(dims), dtype=torch.long, device="cuda")
         self._slam_tree = cKDTree(slam)
 
+        # Depth-violation 채널 준비
+        self._depth = None
+        if cfg.depth_dir:
+            from pathlib import Path as _P
+            names = [l.split()[9] for l in open(_P(source_path) / "sparse/0/images.txt")
+                     if len(l.split()) >= 10 and not l.startswith("#")]
+            stem2ci = {n.rsplit(".", 1)[0]: i for i, n in enumerate(names)}
+            cam_line = [l for l in open(_P(source_path) / "sparse/0/cameras.txt")
+                        if l.strip() and not l.startswith("#")][0].split()
+            self._vr_fx, self._vr_fy = float(cam_line[4]), float(cam_line[5])
+            self._vr_cx, self._vr_cy = float(cam_line[6]), float(cam_line[7])
+            self._vr_w, self._vr_h = int(cam_line[2]), int(cam_line[3])
+            dmaps, dR, dt = [], [], []
+            for f in sorted(_P(cfg.depth_dir).glob("*.npy")):
+                ci = stem2ci.get(f.stem)
+                if ci is None:
+                    continue
+                dmaps.append(torch.tensor(np.load(f) * cfg.depth_scale, dtype=torch.float16))
+                dR.append(Rs[ci]); dt.append(ts[ci])
+            if dmaps:
+                self._depth = torch.stack(dmaps).cuda()               # [F,H,W] fp16
+                self._depth_R = torch.tensor(np.stack(dR), dtype=torch.float32, device="cuda")
+                self._depth_t = torch.tensor(np.stack(dt), dtype=torch.float32, device="cuda")
+                print(f"[CarveLoss] vr channel: {len(dmaps)} depth maps loaded "
+                      f"({self._depth.element_size()*self._depth.nelement()/2**20:.0f} MB)")
+
         # cached per-Gaussian score
         self._score: Optional[torch.Tensor] = None
         self._phi: Optional[torch.Tensor] = None
@@ -205,6 +245,28 @@ class CarveLoss:
         g = gi[inb]
         out[inb] = self._rho[g[:, 0], g[:, 1], g[:, 2]]
         return out
+
+    @torch.no_grad()
+    def _vr(self, xyz: torch.Tensor) -> torch.Tensor:
+        """depth-violation ratio: 보정 depth 표면보다 카메라 쪽에 떠 있는 관측 빈도 [0,1]."""
+        N = xyz.shape[0]
+        viol = torch.zeros(N, device="cuda")
+        vis = torch.zeros(N, device="cuda")
+        for f in range(self._depth.shape[0]):
+            pc = xyz @ self._depth_R[f].T + self._depth_t[f]
+            z = pc[:, 2]
+            ok = (z > 0.3) & (z < 15.0)
+            u = (pc[:, 0] / z.clamp(min=1e-6) * self._vr_fx + self._vr_cx).long()
+            v = (pc[:, 1] / z.clamp(min=1e-6) * self._vr_fy + self._vr_cy).long()
+            ok &= (u >= 0) & (u < self._vr_w) & (v >= 0) & (v < self._vr_h)
+            zm = torch.zeros_like(z)
+            zm[ok] = self._depth[f][v[ok], u[ok]].float()
+            margin = torch.clamp(0.10 * zm, min=0.15)
+            viol += (ok & (z < zm - margin)).float()
+            vis += ok.float()
+        vr = viol / vis.clamp(min=1)
+        vr[vis < self.cfg.vr_min_vis] = 0.0
+        return vr
 
     def _refresh_score(self, gaussians, iteration: int, force: bool = False):
         N = gaussians.get_xyz.shape[0]
@@ -238,7 +300,14 @@ class CarveLoss:
             op_np = opac.cpu().numpy()
             maxop = np.fromiter((op_np[p].max() for p in pairs),
                                 dtype=np.float32, count=N)
-            self._score = w * (1.0 - torch.tensor(maxop, device="cuda"))
+            if self.cfg.no_maxop_protection:
+                # exp43: (1-maxop) 보호항이 이미 불투명해진 먼지 무리를 보호하는
+                # 사각지대 — raw init 장면에서는 w만으로 score 구성
+                self._score = w
+            else:
+                self._score = w * (1.0 - torch.tensor(maxop, device="cuda"))
+            if self._depth is not None:
+                self._score = torch.maximum(self._score, self._vr(xyz))
             self._score_iter = iteration
             self._score_n = N
             if self.cfg.force_enabled:
@@ -331,6 +400,20 @@ class CarveLoss:
                 gaussians.prune_points(kill)
                 self._refresh_score(gaussians, iteration, force=True)
             metrics["carve/gate_pruned"] = n
+
+        # 축5: 살아남은 신생아 중 score 높은 것을 가장 가까운 표면 anchor로 스냅(재유도)
+        if cfg.birth_redirect and densify_happened:
+            newborn = gaussians.birth_step == iteration
+            sel = newborn & (self._score > cfg.redirect_score_min)
+            m = int(sel.sum())
+            if m > 0:
+                xyz_np = gaussians._xyz.detach()[sel].cpu().numpy()
+                _, idx = self._slam_tree.query(xyz_np, workers=-1)
+                target = torch.tensor(self._slam_tree.data[idx], dtype=torch.float32, device="cuda")
+                cur = gaussians._xyz.data[sel]
+                gaussians._xyz.data[sel] = cur + cfg.redirect_alpha * (target - cur)
+                self._refresh_score(gaussians, iteration, force=True)
+            metrics["carve/birth_redirected"] = m
 
         if (cfg.prune_enabled and iteration >= cfg.prune_start_iter
                 and iteration % cfg.prune_interval == 0
