@@ -4,6 +4,7 @@ import os
 import numpy as np
 import pandas as pd
 import argparse
+import json
 from PIL import Image
 from tqdm import tqdm
 from scipy.spatial.transform import Rotation as R
@@ -24,6 +25,8 @@ def main():
     parser.add_argument("--height", type=int, default=1024, help="출력 이미지 세로 해상도")
     parser.add_argument("--frame_stride", type=int, default=1, help="RGB frame sampling stride")
     parser.add_argument("--max_images", type=int, default=0, help="Maximum number of RGB frames to export. 0 means no cap.")
+    parser.add_argument("--max_points", type=int, default=0, help="Reproducibly subsample MPS seed points. 0 means no cap.")
+    parser.add_argument("--point_seed", type=int, default=0, help="Random seed used by --max_points.")
     parser.add_argument("--alpha_mask", action="store_true", help="Fisheye 밖의 빈 공간을 투명 마스킹 처리 (PNG 저장)")
     parser.add_argument("--rotate", action="store_true", help="이미지를 시계 방향으로 90도 회전 및 좌표계 동기화")
     args = parser.parse_args()
@@ -177,12 +180,28 @@ def main():
     # ----------------------------------------------------------------
     print("초기 3D 포인트 클라우드 추출 중...")
     points_df = pd.read_csv(points_csv)
+    total_points = len(points_df)
+    if args.max_points and args.max_points > 0 and total_points > args.max_points:
+        points_df = points_df.sample(n=args.max_points, random_state=args.point_seed).sort_index()
     with open(os.path.join(sparse_out_dir, "points3D.txt"), "w") as f_pts:
         for _, row in points_df.iterrows():
             pid = int(row['uid'])
             x, y, z = row['px_world'], row['py_world'], row['pz_world']
             # 포맷: POINT3D_ID X Y Z R G B ERROR TRACK[]
             f_pts.write(f"{pid} {x} {y} {z} 128 128 128 0\n")
+
+    with open(os.path.join(out_dir, "dataset_build_summary.json"), "w") as f_summary:
+        json.dump({
+            "vrs_file": vrs_file,
+            "trajectory_csv": traj_csv,
+            "points_csv": points_csv,
+            "rgb_frames_in_vrs": num_images,
+            "images_written": valid_img_id - 1,
+            "mps_points_total": total_points,
+            "mps_points_written": len(points_df),
+            "point_seed": args.point_seed,
+            "frame_stride": args.frame_stride,
+        }, f_summary, indent=2)
             
     print(f"변환 완료! 학습 폴더: {os.path.abspath(out_dir)}")
 

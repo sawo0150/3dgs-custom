@@ -41,6 +41,7 @@ import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
 import uuid
+import json
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
@@ -50,6 +51,7 @@ from eval.gaussian_stats import load_sparse_points, save_gaussian_summary, summa
 from eval.sparse_depth_prior import SparseDepthPrior
 from eval.plateau_loss import PlateauLoss, PlateauLossConfig
 from eval.carve_loss import CarveLoss, CarveLossConfig
+from runtime.scheduler import load_arrival_iterations, make_scheduler, scheduler_summary
 
 try:
     # REVIEW: TensorBoard는 "있으면 쓰고 없으면 안 씀" (optional dependency)
@@ -76,7 +78,7 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb_logger=None, plateau_loss_config=None, carve_loss_config=None):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb_logger=None, plateau_loss_config=None, carve_loss_config=None, view_schedule=None, view_scheduler="static_rr", scheduler_seed=0, scheduler_beta=1.0, scheduler_block_size=128, scheduler_loss_alpha=.5):
     # -------------------------------------------------------------------------
     # REVIEW: training() 인자 의미
     #   dataset : 데이터/카메라/이미지/옵션(white_background 등) 포함
@@ -144,8 +146,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     )
 
     # 학습에 사용할 카메라 뷰포인트들을 리스트(스택)로 복사해옵니다.
-    viewpoint_stack = scene.getTrainCameras().copy()
+    all_train_cameras = sorted(scene.getTrainCameras().copy(), key=lambda c: c.image_name)
+    viewpoint_stack = all_train_cameras.copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
+    causal_scheduler, arrival_iterations, next_arrival = None, None, 0
+    if view_schedule:
+        arrival_iterations = load_arrival_iterations(view_schedule, [c.image_name for c in all_train_cameras])
+        if arrival_iterations != sorted(arrival_iterations):
+            raise ValueError("arrival schedule must follow sorted camera order")
+        causal_scheduler = make_scheduler(view_scheduler, scheduler_seed, scheduler_beta, scheduler_block_size,
+                                          opt.densify_until_iter, scheduler_loss_alpha)
+        # A shared model checkpoint must not erase causal sampler history.
+        # Replaying IDs/counts is cheap (no image or CUDA work) and restores
+        # exactly the scheduler state that existed after ``first_iter`` draws.
+        # This enables byte-identical topology checkpoints to branch into two
+        # replay policies without conflating sampler quality with densification.
+        if first_iter > 0:
+            for historical_iteration in range(1, first_iter + 1):
+                historical_added = []
+                while (
+                    next_arrival < len(all_train_cameras)
+                    and arrival_iterations[next_arrival] <= historical_iteration
+                ):
+                    historical_added.append(next_arrival)
+                    next_arrival += 1
+                causal_scheduler.add(historical_added)
+                causal_scheduler.draw()
 
     # 로깅을 위한 지수 이동 평균(EMA) 변수
     ema_loss_for_log = 0.0
@@ -211,12 +237,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # 스택에서 무작위로 카메라 뷰포인트 하나를 뽑습니다. (비어있으면 다시 채움)
         # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-            viewpoint_indices = list(range(len(viewpoint_stack)))
-        rand_idx = randint(0, len(viewpoint_indices) - 1)
-        viewpoint_cam = viewpoint_stack.pop(rand_idx)
-        vind = viewpoint_indices.pop(rand_idx)
+        if causal_scheduler is None:
+            if not viewpoint_stack:
+                viewpoint_stack = all_train_cameras.copy()
+                viewpoint_indices = list(range(len(viewpoint_stack)))
+            rand_idx = randint(0, len(viewpoint_indices) - 1)
+            viewpoint_cam = viewpoint_stack.pop(rand_idx)
+            vind = viewpoint_indices.pop(rand_idx)
+        else:
+            arrived = []
+            while next_arrival < len(all_train_cameras) and arrival_iterations[next_arrival] <= iteration:
+                arrived.append(next_arrival); next_arrival += 1
+            causal_scheduler.add(arrived)
+            vind = causal_scheduler.draw()
+            viewpoint_cam = all_train_cameras[vind]
 
         # Render
         if (iteration - 1) == debug_from:
@@ -392,6 +426,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         with torch.no_grad():
             # 진행 바 업데이트용 Loss 기록
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            if causal_scheduler is not None and hasattr(causal_scheduler, "observe"):
+                causal_scheduler.observe(vind, float(loss_rgb.detach().item()))
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
             ema_sparse_depth_for_log = 0.4 * sparse_depth_loss_value + 0.6 * ema_sparse_depth_for_log
 
@@ -551,6 +587,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
+    if causal_scheduler is not None:
+        payload = scheduler_summary(causal_scheduler, [c.image_name for c in all_train_cameras], arrival_iterations, opt.iterations)
+        payload.update({"name": view_scheduler, "seed": scheduler_seed, "beta": scheduler_beta,
+                        "loss_alpha": scheduler_loss_alpha,
+                        "block_size": scheduler_block_size, "phase_start": opt.densify_until_iter})
+        if hasattr(causal_scheduler, "weighted_phase_start"):
+            payload["weighted_phase_actual_start"] = causal_scheduler.weighted_phase_start
+        with open(Path(dataset.model_path) / "view_scheduler_summary.json", "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
 def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
@@ -661,6 +707,12 @@ if __name__ == "__main__":
     parser.add_argument("--carve_loss_config", type=str, default=None,
                         help="Path to carve loss YAML config. None = disabled. "
                              "Example: configs/carve_loss/exp38_carve.yaml")
+    parser.add_argument("--view_schedule", type=str, default=None)
+    parser.add_argument("--view_scheduler", choices=["static_rr", "causal_rr", "count_balanced_rr", "soft_count", "floor_rr", "lag_rr", "mixed_deficit_rr", "block_weighted_rr", "stable_pool_block_rr", "entropy_floor_rr", "interval_softmax_rr", "interval_size_softmax_rr", "normalized_interval_size_softmax_rr", "staged_interval_size_softmax_rr", "loss_interval_size_softmax_rr", "staged_loss_interval_size_softmax_rr", "bounded_interval_size_softmax_rr", "staged_bounded_interval_size_softmax_rr", "two_pass_interval_size_softmax_rr", "staged_two_pass_interval_size_softmax_rr", "relative_floor_interval_softmax_rr"], default="static_rr")
+    parser.add_argument("--scheduler_seed", type=int, default=0)
+    parser.add_argument("--scheduler_beta", type=float, default=1.0)
+    parser.add_argument("--scheduler_block_size", type=int, default=128)
+    parser.add_argument("--scheduler_loss_alpha", type=float, default=.5)
 
     # -------------------------------------------------------------------------
     # REVIEW: 인자 파싱 및 학습 준비
@@ -686,7 +738,11 @@ if __name__ == "__main__":
     # 파서에서 그룹별로 추출한(extract) 파라미터 묶음들과 리스트 형태의 반복 주기들을 넘겨줍니다.
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from,
              plateau_loss_config=args.plateau_loss_config,
-             carve_loss_config=args.carve_loss_config)
+             carve_loss_config=args.carve_loss_config,
+             view_schedule=args.view_schedule, view_scheduler=args.view_scheduler,
+             scheduler_seed=args.scheduler_seed, scheduler_beta=args.scheduler_beta,
+             scheduler_block_size=args.scheduler_block_size,
+             scheduler_loss_alpha=args.scheduler_loss_alpha)
 
     # All done
     print("\nTraining complete.")
