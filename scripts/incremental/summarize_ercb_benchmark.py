@@ -58,7 +58,8 @@ def main() -> None:
             "ssim": metrics["SSIM"],
             "lpips": metrics["LPIPS"],
             "worst_q1_psnr": quartile_mean(frame_psnr),
-            "thirds_psnr": [statistics.fmean(part.tolist()) for part in np.array_split(frame_psnr, 3)],
+            "thirds_psnr": [statistics.fmean(part.tolist()) for part in np.array_split(frame_psnr, 3)
+                            if len(part)],
             "count_cv": statistics.pstdev(counts) / count_mean,
             "test_image_names": names,
             "per_view_psnr": frame_psnr,
