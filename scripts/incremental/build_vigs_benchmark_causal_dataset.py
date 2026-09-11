@@ -117,7 +117,14 @@ def main() -> None:
     trajectory = load_trajectory(pose_path)
     keyframes = load_trajectory(keyframe_path)
     positions, rotations_c2w = interpolate_poses(timestamps, trajectory)
-    boundaries = nearest_indices(keyframes[:, 0], timestamps)
+    mapped_boundaries = nearest_indices(keyframes[:, 0], timestamps)
+    # VIGS includes the bootstrap keyframe at RGB index 0.  llffhold-8 reserves
+    # that image for evaluation, so treating index 0 as a closed interval would
+    # leave the scheduler with no eligible training view at iteration 1.  The
+    # historical exp74 datasets start with the first non-empty training cohort;
+    # discard only leading boundaries that precede it.
+    first_train_index = next(index for index in range(len(images)) if index % 8 != 0)
+    boundaries = mapped_boundaries[mapped_boundaries >= first_train_index]
     if not len(boundaries):
         raise ValueError("no VIGS keyframe boundaries mapped to RGB frames")
 
@@ -215,7 +222,9 @@ def main() -> None:
         "pose_source_sha256": sha256(pose_path),
         "keyframe_source_sha256": sha256(keyframe_path),
         "raw_vigs_keyframes": len(keyframes),
+        "mapped_rgb_keyframe_boundaries": len(mapped_boundaries),
         "deduplicated_rgb_keyframe_boundaries": len(boundaries),
+        "dropped_leading_heldout_only_boundaries": len(mapped_boundaries) - len(boundaries),
         "max_full_pose_to_rgb_timestamp_error_seconds": float(
             np.max(np.min(np.abs(trajectory[:, 0, None] - timestamps[None, :]), axis=1))
         ),
