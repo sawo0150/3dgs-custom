@@ -78,7 +78,11 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb_logger=None, plateau_loss_config=None, carve_loss_config=None, view_schedule=None, view_scheduler="static_rr", scheduler_seed=0, scheduler_beta=1.0, scheduler_block_size=128, scheduler_loss_alpha=.5):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb_logger=None, plateau_loss_config=None, carve_loss_config=None, view_schedule=None, view_scheduler="static_rr", scheduler_seed=0, scheduler_beta=1.0, scheduler_block_size=128, scheduler_loss_alpha=.5, fixed_topology_step_before_report=False):
+    if fixed_topology_step_before_report and (opt.densify_until_iter != 0 or plateau_loss_config or carve_loss_config):
+        raise ValueError("Post-update reporting requires densify_until_iter=0 and no plateau/carve config")
+    completed_updates = 0
+    training_gpu_ms = 0.0
     # -------------------------------------------------------------------------
     # REVIEW: training() 인자 의미
     #   dataset : 데이터/카메라/이미지/옵션(white_background 등) 포함
@@ -424,6 +428,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # 기울기를 반영하고, 필요에 따라 가우시안을 쪼개거나 삭제합니다.
         # -------------------------------------------------------------------------
         with torch.no_grad():
+            # Exp77 opt-in: each draw is a real update, including the final one;
+            # evaluations/PLY/checkpoints all refer to the post-update state.
+            if fixed_topology_step_before_report:
+                gaussians.exposure_optimizer.step()
+                gaussians.exposure_optimizer.zero_grad(set_to_none=True)
+                if use_sparse_adam:
+                    gaussians.optimizer.step(radii > 0, radii.shape[0])
+                else:
+                    gaussians.optimizer.step()
+                gaussians.optimizer.zero_grad(set_to_none=True)
+                completed_updates += 1
+                iter_end.record()
+                iter_end.synchronize()
+                training_gpu_ms += iter_start.elapsed_time(iter_end)
             # 진행 바 업데이트용 Loss 기록
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if causal_scheduler is not None and hasattr(causal_scheduler, "observe"):
@@ -522,6 +540,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # 정해진 주기마다 TensorBoard 로깅 및 PSNR 평가, 그리고 .ply 모델 저장을 수행합니다.
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+            if fixed_topology_step_before_report and iteration in testing_iterations:
+                with open(Path(dataset.model_path) / "training_timing.jsonl", "a", encoding="utf-8") as output:
+                    output.write(json.dumps({"iteration": iteration, "completed_updates_this_run": completed_updates,
+                                             "training_gpu_ms": training_gpu_ms, "evaluation_included": False}) + "\n")
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -570,7 +592,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 plateau_loss.reset_sampler()
 
             # Optimizer Step (실제 파라미터 업데이트)
-            if iteration < opt.iterations:
+            if iteration < opt.iterations and not fixed_topology_step_before_report:
                 gaussians.exposure_optimizer.step()
                 gaussians.exposure_optimizer.zero_grad(set_to_none = True)
                 # Sparse Adam이면 이번 뷰에서 화면에 보인(visible) 가우시안들만 업데이트하여 속도를 높입니다.
@@ -581,6 +603,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 else:
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
+                completed_updates += 1
 
             # 나중에 이어서 학습할 수 있도록 정해진 이터레이션에 체크포인트(.pth)를 저장합니다.
             if (iteration in checkpoint_iterations):
@@ -592,6 +615,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         payload.update({"name": view_scheduler, "seed": scheduler_seed, "beta": scheduler_beta,
                         "loss_alpha": scheduler_loss_alpha,
                         "block_size": scheduler_block_size, "phase_start": opt.densify_until_iter})
+        payload.update({"completed_updates_this_run": completed_updates,
+                        "post_update_reporting": fixed_topology_step_before_report,
+                        "training_gpu_ms": training_gpu_ms if fixed_topology_step_before_report else None})
         if hasattr(causal_scheduler, "weighted_phase_start"):
             payload["weighted_phase_actual_start"] = causal_scheduler.weighted_phase_start
         with open(Path(dataset.model_path) / "view_scheduler_summary.json", "w", encoding="utf-8") as f:
@@ -635,6 +661,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
+                per_view = {}
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
@@ -646,10 +673,16 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
                     l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
+                    view_psnr = psnr(image, gt_image).mean().double()
+                    psnr_test += view_psnr
+                    per_view[viewpoint.image_name] = float(view_psnr.item())
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                with open(Path(scene.model_path) / "evaluation_curve.jsonl", "a", encoding="utf-8") as output:
+                    output.write(json.dumps({"iteration": iteration, "split": config['name'],
+                                             "psnr": float(psnr_test.item()),
+                                             "per_view_psnr": per_view}) + "\n")
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
@@ -713,6 +746,8 @@ if __name__ == "__main__":
     parser.add_argument("--scheduler_beta", type=float, default=1.0)
     parser.add_argument("--scheduler_block_size", type=int, default=128)
     parser.add_argument("--scheduler_loss_alpha", type=float, default=.5)
+    parser.add_argument("--fixed_topology_step_before_report", action="store_true",
+                        help="Exp77 opt-in: fixed topology, update on every iteration, then evaluate/save")
 
     # -------------------------------------------------------------------------
     # REVIEW: 인자 파싱 및 학습 준비
@@ -742,7 +777,8 @@ if __name__ == "__main__":
              view_schedule=args.view_schedule, view_scheduler=args.view_scheduler,
              scheduler_seed=args.scheduler_seed, scheduler_beta=args.scheduler_beta,
              scheduler_block_size=args.scheduler_block_size,
-             scheduler_loss_alpha=args.scheduler_loss_alpha)
+             scheduler_loss_alpha=args.scheduler_loss_alpha,
+             fixed_topology_step_before_report=args.fixed_topology_step_before_report)
 
     # All done
     print("\nTraining complete.")
